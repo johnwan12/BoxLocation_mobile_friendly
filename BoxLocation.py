@@ -1,13 +1,14 @@
 # BoxLocation.py — Professional UI + Simple Workflow + Sticky Header + Tabs
 # ============================================================
-# Goals implemented:
-# ✅ Professional, simple workflow
-# ✅ Top-level mode tabs: Find / Add / Use / History / Session Report
-# ✅ Clean “Context Bar” (Study + Storage + Tank/Freezer) always visible
-# ✅ Debug + Preflight details hidden by default (auto-expand only on failure)
-# ✅ Sticky header (CSS-based best-effort for Streamlit)
-# ✅ Tables shown as “views” (key columns) with optional “Show all columns”
-# ✅ Keeps your core backend logic: Google Sheets read/write, usage log, delete-at-zero, session report
+# Implemented (as requested):
+# ✅ Storage = LN Tank uses tab LN3 ONLY
+# ✅ Subset LN3 by TankID == LN1/LN2/LN3 and show LN Inventory Table
+# ✅ In FIND tab:
+#    - If Storage=LN Tank: replace “Freezer Search by BoxLabel_group” with LN Inventory Table (selected tank)
+#    - If Storage=Freezer: show Freezer Search by BoxLabel_group (selected freezer)
+# ✅ Professional workflow tabs: Find / Add / Use / History / Session Report
+# ✅ Compact Context Bar always visible + Debug/Preflight hidden by default
+# ✅ Sticky header (best-effort CSS)
 # ============================================================
 
 import logging
@@ -38,10 +39,7 @@ st.markdown(
 /* --- base spacing --- */
 .block-container { padding-top: 0.75rem; }
 
-/* --- sticky header (best-effort) ---
-   Streamlit does not officially support sticky widgets,
-   but this works well in most deployments.
-*/
+/* --- sticky header (best-effort) --- */
 [data-testid="stAppViewContainer"] > .main > div:first-child {
   position: sticky;
   top: 0;
@@ -108,7 +106,7 @@ TAB_MAP = {
 }
 
 BOX_TAB = "boxNumber"
-LN_TAB = "LN3"
+LN_TAB = "LN3"  # NOTE: Always read/write LN from LN3 tab
 FREEZER_TAB = "Freezer_Inventory"
 USE_LOG_TAB = "Use_log"
 
@@ -125,7 +123,7 @@ TUBE_COL = "TubeNumber"
 BOXUID_COL = "BoxUID"
 QR_COL = "QRCodeLink"
 
-# Freezer columns (your schema)
+# Freezer columns
 FREEZER_COL = "FreezerID"
 PREFIX_COL = "Prefix"
 SUFFIX_COL = "Tube suffix"
@@ -564,7 +562,7 @@ def get_current_max_boxnumber_global() -> int:
     return max(m1, m2, 0)
 
 # ============================================================
-# 0) Preflight (hidden unless debug or failure)
+# Preflight (hidden unless debug or failure)
 # ============================================================
 service = sheets_service()
 titles = []
@@ -578,14 +576,12 @@ try:
 except Exception as e:
     preflight_error = e
 
-# Required tabs
 required_tabs = [USE_LOG_TAB, LN_TAB, FREEZER_TAB, BOX_TAB]
 study_required = list(TAB_MAP.values())
 
 missing_tabs = [t for t in required_tabs if t not in titles] if connected_ok else []
 missing_study = [t for t in study_required if t not in titles] if connected_ok else []
 
-# Ensure headers if OK
 if connected_ok and not missing_tabs and not missing_study:
     try:
         _ = get_sheet_id_map(SPREADSHEET_ID)  # warm cache
@@ -601,7 +597,6 @@ if connected_ok and not missing_tabs and not missing_study:
 # ============================================================
 st.markdown("### 📦 Sample Inventory")
 
-# Status row + toggles
 c_status, c_toggles = st.columns([1, 1])
 with c_status:
     if connected_ok:
@@ -610,11 +605,9 @@ with c_status:
         st.error("Not connected", icon="❌")
 
 with c_toggles:
-    # Keep these small; they are “header controls”
     st.session_state.mobile_mode = st.toggle("📱 Mobile", value=st.session_state.mobile_mode)
     st.session_state.debug_mode = st.toggle("🛠️ Debug", value=st.session_state.debug_mode)
 
-# If failure or debug, show preflight expander
 if (not connected_ok) or st.session_state.debug_mode:
     with st.expander("Connection & Preflight", expanded=not connected_ok):
         st.caption("Hidden by default. Expands on error or when Debug is ON.")
@@ -631,24 +624,19 @@ if (not connected_ok) or st.session_state.debug_mode:
             if missing_study:
                 st.error(f"Missing required study tabs (TAB_MAP values): {missing_study}")
 
-# Hard stop if not connected
 if not connected_ok:
     st.stop()
-
 if missing_tabs or missing_study:
     st.error("Fix your Google Sheet tab names (see Connection & Preflight above).")
     st.stop()
 
 # -------------------- Context Bar --------------------
-# Keep this compact and consistent.
 ctx1, ctx2, ctx3 = st.columns([1.25, 1, 1])
 
 with ctx1:
     selected_display_tab = st.selectbox("Study", DISPLAY_TABS, index=0, key="ctx_study")
-
 with ctx2:
     STORAGE_TYPE = st.selectbox("Storage", ["LN Tank", "Freezer"], index=0, key="ctx_storage")
-
 with ctx3:
     if STORAGE_TYPE == "LN Tank":
         selected_tank = st.selectbox("Tank", ["LN1", "LN2", "LN3"], index=2, key="ctx_tank")
@@ -660,7 +648,7 @@ with ctx3:
 STORAGE_ID = selected_tank if STORAGE_TYPE == "LN Tank" else selected_freezer
 
 # ============================================================
-# Top-level mode tabs (the actual workflow)
+# Top-level mode tabs
 # ============================================================
 tab_find, tab_add, tab_use, tab_history, tab_session = st.tabs(
     ["🔎 Find", "➕ Add", "📉 Use", "🧾 History", "✅ Session Report"]
@@ -672,7 +660,7 @@ tab_find, tab_add, tab_use, tab_history, tab_session = st.tabs(
 with tab_find:
     st.subheader("Find / Locate")
 
-    # --- Box Location (Study tab view + StudyID -> BoxNumber) ---
+    # Optional: keep Box Location always visible
     with st.expander("📦 Box Location", expanded=True):
         tab_name = TAB_MAP[selected_display_tab]
         try:
@@ -706,59 +694,96 @@ with tab_find:
             st.error("Box Location failed.")
             st.code(err_detail(e), language="text")
 
-    # --- Quick Freezer search by BoxLabel_group ---
-    with st.expander("🧊 Freezer Search by BoxLabel_group", expanded=False):
-        try:
-            fr_all_df = read_tab(FREEZER_TAB)
-            if fr_all_df.empty:
-                st.info("Freezer_Inventory is empty.")
-            elif BOX_LABEL_COL not in fr_all_df.columns:
-                st.error(f"Missing column '{BOX_LABEL_COL}' in {FREEZER_TAB}.")
-            else:
-                df_search = fr_all_df.copy()
-                if FREEZER_COL in df_search.columns:
-                    df_search[FREEZER_COL] = df_search[FREEZER_COL].astype(str).map(lambda x: safe_strip(x).upper())
-
-                freezer_filter = st.selectbox(
-                    "Filter freezer (optional)",
-                    ["(all)"] + sorted([f for f in df_search[FREEZER_COL].dropna().unique().tolist() if safe_strip(f)]),
-                    key="find_freezer_filter",
-                )
-                if freezer_filter != "(all)":
-                    df_search = df_search[df_search[FREEZER_COL] == safe_strip(freezer_filter).upper()].copy()
-
-                df_search[BOX_LABEL_COL] = df_search[BOX_LABEL_COL].astype(str).map(safe_strip)
-                groups = sorted([g for g in df_search[BOX_LABEL_COL].dropna().unique().tolist() if safe_strip(g)])
-
-                mode = st.radio("Mode", ["Exact", "Contains"], horizontal=not st.session_state.mobile_mode, key="find_fr_mode")
-
-                if mode == "Exact":
-                    chosen_group = st.selectbox("BoxLabel_group", ["(select)"] + groups, key="find_fr_group_exact")
-                    if chosen_group != "(select)":
-                        out = df_search[df_search[BOX_LABEL_COL] == safe_strip(chosen_group)].copy()
-                        st.caption(f"Matches: {len(out)}")
-                        show_df_view(
-                            out,
-                            key_cols=[FREEZER_COL, BOX_LABEL_COL, BOXID_COL, PREFIX_COL, SUFFIX_COL, AMT_COL, DATE_COLLECTED_COL, MEMO_COL],
-                            height_mobile=320,
-                            height_desktop=420,
-                            key_prefix="find_fr_exact",
-                        )
+    # ------------------------------------------------------------
+    # Requested change:
+    # When Storage=LN Tank -> replace Freezer Search panel with LN Inventory Table for selected tank
+    # When Storage=Freezer -> show Freezer Search panel
+    # ------------------------------------------------------------
+    if STORAGE_TYPE == "LN Tank":
+        with st.expander(f"🧊 LN Inventory Table ({selected_tank})", expanded=True):
+            try:
+                ln_all_df = read_tab(LN_TAB)  # always LN3
+                if ln_all_df.empty:
+                    st.info("LN3 is empty.")
                 else:
-                    q = st.text_input("BoxLabel_group contains…", placeholder="e.g., HP-COC", key="find_fr_contains").strip()
-                    if q:
-                        out = df_search[df_search[BOX_LABEL_COL].astype(str).str.lower().str.contains(q.lower(), na=False)].copy()
-                        st.caption(f"Matches: {len(out)}")
-                        show_df_view(
-                            out,
-                            key_cols=[FREEZER_COL, BOX_LABEL_COL, BOXID_COL, PREFIX_COL, SUFFIX_COL, AMT_COL, DATE_COLLECTED_COL, MEMO_COL],
-                            height_mobile=320,
-                            height_desktop=420,
-                            key_prefix="find_fr_contains_view",
-                        )
-        except Exception as e:
-            st.error("Freezer search failed.")
-            st.code(err_detail(e), language="text")
+                    # Clean 0 rows (optional, safe)
+                    try:
+                        if cleanup_zero_amount_rows(service, LN_TAB, ln_all_df, AMT_COL):
+                            ln_all_df = read_tab(LN_TAB)
+                    except Exception:
+                        pass
+
+                    if TANK_COL not in ln_all_df.columns:
+                        st.error(f"LN3 missing required column: '{TANK_COL}'")
+                    else:
+                        ln_view_df = ln_all_df.copy()
+                        ln_view_df[TANK_COL] = ln_view_df[TANK_COL].astype(str).map(lambda x: safe_strip(x).upper())
+                        ln_view_df = ln_view_df[ln_view_df[TANK_COL] == safe_strip(selected_tank).upper()].copy()
+
+                        if ln_view_df.empty:
+                            st.info(f"No records for {selected_tank}.")
+                        else:
+                            show_df_view(
+                                ln_view_df,
+                                key_cols=[TANK_COL, RACK_COL, BOX_LABEL_COL, BOXID_COL, TUBE_COL, AMT_COL, MEMO_COL],
+                                height_mobile=360,
+                                height_desktop=520,
+                                key_prefix="find_ln_table",
+                            )
+            except Exception as e:
+                st.error("Failed to load LN inventory.")
+                st.code(err_detail(e), language="text")
+
+    else:
+        with st.expander("🧊 Freezer Search by BoxLabel_group", expanded=True):
+            try:
+                fr_all_df = read_tab(FREEZER_TAB)
+                if fr_all_df.empty:
+                    st.info("Freezer_Inventory is empty.")
+                elif BOX_LABEL_COL not in fr_all_df.columns:
+                    st.error(f"Missing column '{BOX_LABEL_COL}' in {FREEZER_TAB}.")
+                else:
+                    df_search = fr_all_df.copy()
+                    if FREEZER_COL in df_search.columns:
+                        df_search[FREEZER_COL] = df_search[FREEZER_COL].astype(str).map(lambda x: safe_strip(x).upper())
+
+                    # Restrict to selected freezer from Context Bar (professional: no extra filter needed)
+                    df_search = df_search[df_search[FREEZER_COL] == safe_strip(selected_freezer).upper()].copy()
+
+                    df_search[BOX_LABEL_COL] = df_search[BOX_LABEL_COL].astype(str).map(safe_strip)
+                    groups = sorted([g for g in df_search[BOX_LABEL_COL].dropna().unique().tolist() if safe_strip(g)])
+
+                    mode = st.radio("Mode", ["Exact", "Contains"], horizontal=not st.session_state.mobile_mode, key="find_fr_mode")
+
+                    if mode == "Exact":
+                        chosen_group = st.selectbox("BoxLabel_group", ["(select)"] + groups, key="find_fr_group_exact")
+                        if chosen_group != "(select)":
+                            out = df_search[df_search[BOX_LABEL_COL] == safe_strip(chosen_group)].copy()
+                            st.caption(f"Matches: {len(out)}")
+                            show_df_view(
+                                out,
+                                key_cols=[FREEZER_COL, BOX_LABEL_COL, BOXID_COL, PREFIX_COL, SUFFIX_COL, AMT_COL, DATE_COLLECTED_COL, MEMO_COL],
+                                height_mobile=320,
+                                height_desktop=420,
+                                key_prefix="find_fr_exact",
+                            )
+                    else:
+                        q = st.text_input("BoxLabel_group contains…", placeholder="e.g., HP-COC", key="find_fr_contains").strip()
+                        if q:
+                            out = df_search[df_search[BOX_LABEL_COL].astype(str).str.lower().str.contains(q.lower(), na=False)].copy()
+                            st.caption(f"Matches: {len(out)}")
+                            show_df_view(
+                                out,
+                                key_cols=[FREEZER_COL, BOX_LABEL_COL, BOXID_COL, PREFIX_COL, SUFFIX_COL, AMT_COL, DATE_COLLECTED_COL, MEMO_COL],
+                                height_mobile=320,
+                                height_desktop=420,
+                                key_prefix="find_fr_contains_view",
+                            )
+                        else:
+                            st.info("Type a search term to filter.")
+            except Exception as e:
+                st.error("Freezer search failed.")
+                st.code(err_detail(e), language="text")
 
 # ============================================================
 # ADD
@@ -815,7 +840,6 @@ with tab_add:
 
             tube_number = normalize_spaces(f"{tube_prefix} {tube_suffix}" if tube_suffix else "")
 
-            # Preview BoxUID + QR
             preview_uid, preview_qr, preview_err = "", "", ""
             try:
                 preview_uid = compute_next_boxuid(ln_view_df, selected_tank_add, rack, hp_hn, drug_code)
@@ -885,7 +909,7 @@ with tab_add:
         st.caption(f"Global current max BoxNumber/BoxID: {current_max_boxnumber if current_max_boxnumber else '(none)'}")
 
         with st.form("add_fr_form", clear_on_submit=True):
-            freezer_id = st.text_input("FreezerID", value="SAMMY", key="add_fr_freezer").strip().upper()
+            freezer_id = st.text_input("FreezerID", value=safe_strip(selected_freezer or "SAMMY").upper(), key="add_fr_freezer").strip().upper()
 
             box_choice = st.radio(
                 "BoxID option",
@@ -925,7 +949,7 @@ with tab_add:
                 except Exception:
                     fr_all_df = pd.DataFrame()
 
-                # Duplicate check (same FreezerID/BoxLabel_group/BoxID/Prefix/Tube suffix)
+                # Duplicate check
                 def _norm(s: str) -> str:
                     return normalize_spaces(s)
 
@@ -991,29 +1015,29 @@ with tab_use:
     st.subheader("Use / Log Usage")
     st.caption("Select an item → enter Use + User + ShippingTo → submits to Use_log and subtracts TubeAmount.")
 
-    # Load both inventories once for the page
     try:
         ln_all_df = read_tab(LN_TAB)
     except Exception:
         ln_all_df = pd.DataFrame()
+
     try:
         fr_all_df = read_tab(FREEZER_TAB)
     except Exception:
         fr_all_df = pd.DataFrame()
 
-    # Auto-clean (optional but nice)
+    # Auto-clean (optional)
     try:
         if not ln_all_df.empty and cleanup_zero_amount_rows(service, LN_TAB, ln_all_df, AMT_COL):
             ln_all_df = read_tab(LN_TAB)
     except Exception:
         pass
+
     try:
         if not fr_all_df.empty and cleanup_zero_amount_rows(service, FREEZER_TAB, fr_all_df, AMT_COL):
             fr_all_df = read_tab(FREEZER_TAB)
     except Exception:
         pass
 
-    # Use flow depends on STORAGE_TYPE from context bar
     if STORAGE_TYPE == "LN Tank":
         if ln_all_df.empty:
             st.info("LN3 is empty.")
@@ -1033,7 +1057,6 @@ with tab_use:
                 dfv["_prefix"] = dfv[TUBE_COL].map(lambda x: split_tube_number(x)[0].upper())
                 dfv["_suffix"] = dfv[TUBE_COL].map(lambda x: split_tube_number(x)[1])
 
-                # Restrict to selected tank in context bar
                 scoped = dfv[dfv[TANK_COL] == safe_strip(selected_tank).upper()].copy()
 
                 if scoped.empty:
@@ -1072,7 +1095,6 @@ with tab_use:
 
                     match_df = scoped4[scoped4["_suffix"] == safe_strip(chosen_suffix)].copy() if chosen_suffix != "(select)" else scoped4.iloc[0:0].copy()
 
-                    # Matched item card
                     if not match_df.empty:
                         r = match_df.iloc[0]
                         st.info(
@@ -1115,7 +1137,6 @@ with tab_use:
 
                             rack_number = get_ln_racknumber_by_index(ln_all_df, idx0)
 
-                            # Append Use_log
                             append_row_by_header(
                                 service,
                                 USE_LOG_TAB,
@@ -1135,7 +1156,6 @@ with tab_use:
                                 ),
                             )
 
-                            # Update inventory
                             if new_amount == 0:
                                 delete_row_by_index(service, LN_TAB, idx0)
                                 st.success("Logged ✅ Saved to Use_log. TubeAmount reached 0 → row deleted.")
@@ -1143,7 +1163,6 @@ with tab_use:
                                 update_amount_by_index(service, LN_TAB, idx0, AMT_COL, new_amount)
                                 st.success(f"Logged ✅ Remaining TubeAmount: {new_amount}")
 
-                            # Session report
                             ts = now_timestamp_str()
                             st.session_state.usage_final_rows.append(
                                 build_final_report_row(
@@ -1163,7 +1182,6 @@ with tab_use:
                             st.rerun()
 
     else:
-        # Freezer usage
         if fr_all_df.empty:
             st.info("Freezer_Inventory is empty.")
         else:
@@ -1179,7 +1197,6 @@ with tab_use:
                 dfv[SUFFIX_COL] = dfv[SUFFIX_COL].astype(str).map(normalize_spaces)
                 dfv[AMT_COL] = pd.to_numeric(dfv[AMT_COL], errors="coerce").fillna(0).astype(int)
 
-                # Restrict to selected freezer in context bar
                 scoped = dfv[dfv[FREEZER_COL] == safe_strip(selected_freezer).upper()].copy()
 
                 if scoped.empty:
