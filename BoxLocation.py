@@ -10,9 +10,12 @@
 #   - Full-width buttons on mobile via CSS
 #
 # + ✅ Google Sheets API robustness:
-#   - Preflight: list tabs and stop with clear error if required tabs missing
+#   - Preflight: list tabs and stop with clear error if required tabs missing (including study tabs)
 #   - Use unquoted A1 ranges (tab!A1:ZZ) to avoid parsing issues
 #   - Safer error logging helper for HttpError (best-effort)
+#   - Cache tab title -> sheetId map to avoid repeated metadata calls
+#   - More robust header handling (trim trailing blank headers)
+#   - Faster max BoxNumber/BoxID scan (read only relevant columns)
 # ============================================================
 
 import logging
@@ -32,8 +35,8 @@ from googleapiclient.errors import HttpError
 # -------------------- Page --------------------
 st.set_page_config(
     page_title="Box Location + LN/Freezer",
-    layout="centered",               # ✅ better on mobile
-    initial_sidebar_state="collapsed"
+    layout="centered",
+    initial_sidebar_state="collapsed",
 )
 st.title("📦 Box Location + 🧊 LN Tank + 🧊 Freezer Inventory")
 
@@ -67,7 +70,7 @@ if "last_qr_link" not in st.session_state:
 if "last_qr_uid" not in st.session_state:
     st.session_state.last_qr_uid = ""
 if "usage_final_rows" not in st.session_state:
-    st.session_state.usage_final_rows = []  # session final report (TubeAmount hidden)
+    st.session_state.usage_final_rows = []
 
 if "custom_boxlabel_groups" not in st.session_state:
     st.session_state.custom_boxlabel_groups = set()
@@ -75,7 +78,7 @@ if "custom_prefixes" not in st.session_state:
     st.session_state.custom_prefixes = set()
 
 if "mobile_mode" not in st.session_state:
-    st.session_state.mobile_mode = True  # ✅ default ON (good for phones)
+    st.session_state.mobile_mode = True
 st.session_state.mobile_mode = st.toggle("📱 Mobile mode", value=st.session_state.mobile_mode)
 
 # -------------------- Constants --------------------
@@ -122,14 +125,12 @@ QR_PX = 118
 SPREADSHEET_ID = st.secrets["connections"]["gsheets"]["spreadsheet"]
 NY_TZ = pytz.timezone("America/New_York")
 
-
 # -------------------- Google Sheets service --------------------
 @st.cache_resource(show_spinner=False)
 def sheets_service():
     scopes = ["https://www.googleapis.com/auth/spreadsheets"]
     creds = Credentials.from_service_account_info(dict(st.secrets["google_service_account"]), scopes=scopes)
     return build("sheets", "v4", credentials=creds, cache_discovery=False)
-
 
 # -------------------- Helpers --------------------
 def safe_strip(x) -> str:
@@ -184,7 +185,6 @@ def fetch_bytes(url: str, timeout: int = 10) -> bytes:
         return resp.read()
 
 def err_detail(e: Exception) -> str:
-    # Best-effort: Streamlit Cloud may redact, but logs will include details.
     try:
         if isinstance(e, HttpError):
             content = getattr(e, "content", b"")
@@ -206,9 +206,14 @@ def read_tab(tab_name: str) -> pd.DataFrame:
     if not values:
         return pd.DataFrame()
 
-    header = [safe_strip(h) for h in values[0]]
+    header_raw = [safe_strip(h) for h in values[0]]
+    last = max([i for i, h in enumerate(header_raw) if h != ""], default=-1)
+    header = header_raw[: last + 1] if last >= 0 else []
     rows = values[1:]
     n = len(header)
+
+    if n == 0:
+        return pd.DataFrame()
 
     fixed = []
     for r in rows:
@@ -221,60 +226,16 @@ def read_tab(tab_name: str) -> pd.DataFrame:
 
     return pd.DataFrame(fixed, columns=header)
 
-def build_box_map() -> dict:
-    df = read_tab(BOX_TAB)
-    if df.empty:
-        return {}
-
-    study_candidates = ["StudyID", "Study ID", "Study Id", "ID"]
-    box_candidates = ["BoxNumber", "Box Number", "Box", "Box#", "Box #"]
-
-    study_col = next((c for c in study_candidates if c in df.columns), None)
-    box_col = next((c for c in box_candidates if c in df.columns), None)
-    if study_col is None or box_col is None:
-        return {}
-
-    m = {}
-    for _, r in df.iterrows():
-        sid = safe_strip(r.get(study_col, "")).upper()
-        bx = safe_strip(r.get(box_col, ""))
-        if sid:
-            m[sid] = bx
-    return m
-
-def get_max_numeric_in_column(df: pd.DataFrame, col: str) -> int:
-    if df is None or df.empty or col not in df.columns:
-        return 0
-    s = pd.to_numeric(df[col], errors="coerce").dropna()
-    return int(s.max()) if not s.empty else 0
-
-def get_current_max_boxnumber_global() -> int:
-    """
-    current_max_boxnumber = max(
-      boxNumber tab column 'BoxNumber',
-      Freezer_Inventory tab column 'BoxID'
-    )
-    """
-    try:
-        df_box = read_tab(BOX_TAB)
-    except Exception:
-        df_box = pd.DataFrame()
-
-    try:
-        df_fr = read_tab(FREEZER_TAB)
-    except Exception:
-        df_fr = pd.DataFrame()
-
-    max_boxnumber = get_max_numeric_in_column(df_box, "BoxNumber")
-    max_freezer_boxid = get_max_numeric_in_column(df_fr, BOXID_COL)
-    return max(max_boxnumber, max_freezer_boxid, 0)
+@st.cache_data(show_spinner=False)
+def get_sheet_id_map(spreadsheet_id: str) -> dict:
+    svc = sheets_service()
+    meta = svc.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+    return {s["properties"]["title"]: int(s["properties"]["sheetId"]) for s in meta.get("sheets", [])}
 
 def get_sheet_id(service, sheet_title: str) -> int:
-    meta = service.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
-    for s in meta.get("sheets", []):
-        props = s.get("properties", {})
-        if props.get("title") == sheet_title:
-            return int(props.get("sheetId"))
+    m = get_sheet_id_map(SPREADSHEET_ID)
+    if sheet_title in m:
+        return m[sheet_title]
     raise ValueError(f"Could not find sheetId for tab: {sheet_title}")
 
 def get_header(service, tab: str) -> list:
@@ -284,7 +245,9 @@ def get_header(service, tab: str) -> list:
         valueRenderOption="UNFORMATTED_VALUE",
     ).execute()
     row1 = (resp.get("values", [[]]) or [[]])[0]
-    return [safe_strip(x) for x in row1]
+    row1 = [safe_strip(x) for x in row1]
+    last = max([i for i, h in enumerate(row1) if h != ""], default=-1)
+    return row1[: last + 1] if last >= 0 else []
 
 def set_header_if_blank(service, tab: str, header: list):
     resp = service.spreadsheets().values().get(
@@ -306,9 +269,6 @@ def append_row_by_header(service, tab: str, data: dict):
     header = get_header(service, tab)
     if not header or all(h == "" for h in header):
         raise ValueError(f"{tab} header row is empty.")
-
-    last = max(i for i, h in enumerate(header) if h != "")
-    header = header[: last + 1]
 
     aligned = [data.get(col, "") for col in header]
     service.spreadsheets().values().append(
@@ -336,7 +296,7 @@ def cleanup_zero_amount_rows(service, tab_name: str, df: pd.DataFrame, amount_co
             "range": {
                 "sheetId": sheet_id,
                 "dimension": "ROWS",
-                "startIndex": idx0 + 1,  # +1: header
+                "startIndex": idx0 + 1,  # +1 header
                 "endIndex": idx0 + 2,
             }
         }
@@ -354,11 +314,9 @@ def update_amount_by_index(service, tab_name: str, idx0: int, amount_col: str, n
     header = get_header(service, tab_name)
     if amount_col not in header:
         raise ValueError(f"{tab_name} missing '{amount_col}' column in header.")
-
     col_idx = header.index(amount_col)
     a1_col = col_to_a1(col_idx)
     sheet_row = idx0 + 2
-
     service.spreadsheets().values().update(
         spreadsheetId=SPREADSHEET_ID,
         range=f"{tab_name}!{a1_col}{sheet_row}",
@@ -576,6 +534,59 @@ def show_df_mobile(df: pd.DataFrame, key_cols: list, height_mobile: int = 360, h
     else:
         st.dataframe(df, use_container_width=True, hide_index=True, height=height_desktop)
 
+def build_box_map() -> dict:
+    df = read_tab(BOX_TAB)
+    if df.empty:
+        return {}
+
+    study_candidates = ["StudyID", "Study ID", "Study Id", "ID"]
+    box_candidates = ["BoxNumber", "Box Number", "Box", "Box#", "Box #"]
+
+    study_col = next((c for c in study_candidates if c in df.columns), None)
+    box_col = next((c for c in box_candidates if c in df.columns), None)
+    if study_col is None or box_col is None:
+        return {}
+
+    m = {}
+    for _, r in df.iterrows():
+        sid = safe_strip(r.get(study_col, "")).upper()
+        bx = safe_strip(r.get(box_col, ""))
+        if sid:
+            m[sid] = bx
+    return m
+
+def read_column_values(tab: str, col_name: str) -> pd.Series:
+    svc = sheets_service()
+    header = get_header(svc, tab)
+    if not header or col_name not in header:
+        return pd.Series(dtype="float")
+    col_idx = header.index(col_name)
+    a1 = col_to_a1(col_idx)
+    resp = svc.spreadsheets().values().get(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"{tab}!{a1}2:{a1}",
+        valueRenderOption="UNFORMATTED_VALUE",
+    ).execute()
+    vals = [v[0] for v in resp.get("values", []) if v]
+    return pd.to_numeric(pd.Series(vals), errors="coerce")
+
+def get_current_max_boxnumber_global() -> int:
+    """
+    current_max = max(boxNumber[BoxNumber], Freezer_Inventory[BoxID])
+    Reads only those columns for speed.
+    """
+    try:
+        s_box = read_column_values(BOX_TAB, "BoxNumber")
+    except Exception:
+        s_box = pd.Series(dtype="float")
+    try:
+        s_fr = read_column_values(FREEZER_TAB, BOXID_COL)
+    except Exception:
+        s_fr = pd.Series(dtype="float")
+
+    m1 = int(s_box.dropna().max()) if not s_box.dropna().empty else 0
+    m2 = int(s_fr.dropna().max()) if not s_fr.dropna().empty else 0
+    return max(m1, m2, 0)
 
 # ============================================================
 # 2) Services + PRE-FLIGHT CHECK (tabs + permission)
@@ -598,11 +609,25 @@ except Exception as e:
     st.write("Service account:", st.secrets["google_service_account"].get("client_email", "(unknown)"))
     st.stop()
 
+# Warm cache (sheetId map)
+try:
+    _ = get_sheet_id_map(SPREADSHEET_ID)
+except Exception:
+    pass
+
 required_tabs = [USE_LOG_TAB, LN_TAB, FREEZER_TAB, BOX_TAB]
 missing = [t for t in required_tabs if t not in titles]
 if missing:
     st.error(f"❌ Missing required tabs: {missing}")
-    st.info("Fix: rename your Google Sheet tabs to match exactly, OR update constants USE_LOG_TAB/LN_TAB/FREEZER_TAB/BOX_TAB to the real names above.")
+    st.info("Fix: rename your Google Sheet tabs to match exactly, OR update constants USE_LOG_TAB/LN_TAB/FREEZER_TAB/BOX_TAB.")
+    st.stop()
+
+# ALSO require study tabs (TAB_MAP values)
+study_required = list(TAB_MAP.values())
+missing_study = [t for t in study_required if t not in titles]
+if missing_study:
+    st.error(f"❌ Missing required study tabs (from TAB_MAP): {missing_study}")
+    st.info("Fix: rename your Google Sheet tabs to match TAB_MAP values exactly, OR update TAB_MAP.")
     st.stop()
 
 # Headers (safe after preflight)
@@ -615,7 +640,6 @@ except Exception as e:
     st.error("❌ Failed ensuring headers (check sheet permissions and tab names).")
     st.code(err_detail(e), language="text")
     st.stop()
-
 
 # ============================================================
 # Controls (Mobile-friendly expander instead of sidebar)
@@ -636,13 +660,12 @@ with st.expander("⚙️ Controls", expanded=True if st.session_state.mobile_mod
         selected_tank = st.selectbox("Select LN Tank", TANK_OPTIONS, index=2, key="ctl_tank")
         selected_freezer = None
     else:
-        FREEZER_OPTIONS = ["Sammy", "Tom", "Jerry"]  # rename as you like
+        FREEZER_OPTIONS = ["Sammy", "Tom", "Jerry"]
         selected_freezer = st.selectbox("Select Freezer", FREEZER_OPTIONS, index=0, key="ctl_freezer")
         selected_tank = None
 
     STORAGE_ID = selected_tank if STORAGE_TYPE == "LN Tank" else selected_freezer
     st.caption(f"Spreadsheet: {SPREADSHEET_ID[:10]}...")
-
 
 # ============================================================
 # 1) BOX LOCATION
@@ -684,7 +707,6 @@ except Exception as e:
     st.error("Unexpected error (Box Location)")
     st.code(str(e), language="text")
 
-
 # ============================================================
 # 3) Use_log viewer (always visible)
 # ============================================================
@@ -702,7 +724,6 @@ try:
         show_df_mobile(tail_df, key_cols=key_cols, height_mobile=360, height_desktop=520, key_prefix="uselog")
 except Exception as e:
     st.warning(f"Unable to read Use_log: {e}")
-
 
 # ============================================================
 # 4) LN MODULE
@@ -757,8 +778,12 @@ else:
         current_max_boxid = get_current_max_boxid(ln_view_df)
         st.caption(f"Current max BoxID in {selected_tank}: {current_max_boxid if current_max_boxid else '(none)'}")
 
-        box_choice = st.radio("BoxID option", ["Using previous box", "Open a new box"],
-                              horizontal=not st.session_state.mobile_mode, key="ln_add_box_choice")
+        box_choice = st.radio(
+            "BoxID option",
+            ["Using previous box", "Open a new box"],
+            horizontal=not st.session_state.mobile_mode,
+            key="ln_add_box_choice",
+        )
         opened_new_box = (box_choice == "Open a new box")
 
         if box_choice == "Using previous box":
@@ -841,7 +866,7 @@ else:
 
             except Exception as e:
                 st.error("Failed to save LN record")
-                st.code(str(e), language="text")
+                st.code(err_detail(e), language="text")
 
     # Download last QR
     if st.session_state.last_qr_link:
@@ -862,6 +887,7 @@ else:
         ln_all_df = read_tab(LN_TAB)
     except Exception:
         ln_all_df = pd.DataFrame()
+
     ln_view_df = ln_all_df.copy()
     if not ln_view_df.empty and TANK_COL in ln_view_df.columns:
         ln_view_df[TANK_COL] = ln_view_df[TANK_COL].astype(str).map(lambda x: safe_strip(x).upper())
@@ -876,7 +902,7 @@ else:
             key_cols=[TANK_COL, RACK_COL, BOX_LABEL_COL, BOXID_COL, TUBE_COL, AMT_COL, MEMO_COL],
             height_mobile=360,
             height_desktop=520,
-            key_prefix="ln_table"
+            key_prefix="ln_table",
         )
 
     # ---------- Log Usage (LN) ----------
@@ -1007,7 +1033,6 @@ else:
                     )
                     st.rerun()
 
-
 # ============================================================
 # 5) FREEZER MODULE
 # + NEW: Search by BoxLabel_group
@@ -1045,7 +1070,7 @@ else:
             key_cols=[FREEZER_COL, BOX_LABEL_COL, BOXID_COL, PREFIX_COL, SUFFIX_COL, AMT_COL, DATE_COLLECTED_COL, MEMO_COL],
             height_mobile=360,
             height_desktop=520,
-            key_prefix="fr_table"
+            key_prefix="fr_table",
         )
 
     # NEW) Search Freezer_Inventory by BoxLabel_group
@@ -1082,7 +1107,7 @@ else:
                     key_cols=[FREEZER_COL, BOX_LABEL_COL, BOXID_COL, PREFIX_COL, SUFFIX_COL, AMT_COL, DATE_COLLECTED_COL, MEMO_COL],
                     height_mobile=320,
                     height_desktop=420,
-                    key_prefix="fr_search_exact"
+                    key_prefix="fr_search_exact",
                 )
         else:
             q = st.text_input("BoxLabel_group contains…", placeholder="e.g., HP-COC", key="fr_search_group_contains").strip()
@@ -1097,7 +1122,7 @@ else:
                     key_cols=[FREEZER_COL, BOX_LABEL_COL, BOXID_COL, PREFIX_COL, SUFFIX_COL, AMT_COL, DATE_COLLECTED_COL, MEMO_COL],
                     height_mobile=320,
                     height_desktop=420,
-                    key_prefix="fr_search_contains"
+                    key_prefix="fr_search_contains",
                 )
 
     # ---------- AddFreezer Inventory Record (Manual / Full Fields) ----------
@@ -1366,7 +1391,6 @@ else:
                         )
                     )
                     st.rerun()
-
 
 # ============================================================
 # 6) Final Report (combined; TubeAmount hidden; Use shown)
