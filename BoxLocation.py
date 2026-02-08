@@ -34,6 +34,8 @@
 #    - Tube label: Prefix auto (01=ADP for AD+, 02=ADN for AD-) + Tube suffix 001-999
 #    - Freezer boxNumber StudyID is collision-safe: "AD {Prefix} {Tube suffix}"
 #    - Other than naming differences, processes are the same.
+#
+# ✅ NEW: Freezer_Inventory includes StudyCode column (written on add; displayed in Find/Use)
 # ============================================================
 
 import re
@@ -169,6 +171,9 @@ BOXID_COL = "BoxID"
 AMT_COL = "TubeAmount"
 MEMO_COL = "Memo"
 
+# ✅ NEW column in Freezer_Inventory
+STUDYCODE_COL = "StudyCode"
+
 # LN columns
 TANK_COL = "TankID"
 RACK_COL = "RackNumber"
@@ -273,7 +278,7 @@ def validate_ad_suffix_or_stop(tube_suffix: str):
 def make_studyid_for_boxnumber(display_study: str, prefix: str, tube_suffix: str, box_label_group: str = "") -> str:
     """
     For AD: collision-safe StudyID = "AD {Prefix} {Tube suffix}" (e.g., "AD 01 007")
-    For others: existing StudyID = "{Prefix} {Tube suffix}"
+    For others: StudyID = "{Prefix} {Tube suffix}"
     """
     display_study = safe_strip(display_study)
     prefix = safe_strip(prefix).upper()
@@ -496,7 +501,9 @@ def ensure_ln_header(service):
     ])
 
 def ensure_freezer_header(service):
+    # ✅ NEW: StudyCode included
     set_header_if_blank(service, FREEZER_TAB, [
+        "StudyCode",
         "FreezerID", "BoxID", "Prefix", "Tube suffix", "TubeAmount",
         "Date Collected", "BoxLabel_group", "Samples Received",
         "Missing", "Urine Results", "Collected By", "Memo",
@@ -563,7 +570,6 @@ def freezer_studyid_from_row(df: pd.DataFrame, idx0: int) -> str:
         p = safe_strip(df.loc[idx0, PREFIX_COL]).upper()
         s = safe_strip(df.loc[idx0, SUFFIX_COL])
         g = safe_strip(df.loc[idx0, BOX_LABEL_COL]) if (BOX_LABEL_COL in df.columns) else ""
-        # AD rows -> "AD {Prefix} {Suffix}"
         return make_studyid_for_boxnumber(display_study="", prefix=p, tube_suffix=s, box_label_group=g)
     except Exception:
         return ""
@@ -790,7 +796,7 @@ try:
     _ = get_sheet_id_map(SPREADSHEET_ID)
     ensure_use_log_header(service)
     ensure_ln_header(service)
-    ensure_freezer_header(service)
+    ensure_freezer_header(service)  # ✅ includes StudyCode if header row is blank
     ensure_boxnumber_header(service)
 except Exception:
     st.error("❌ Sheet preflight failed (headers/tabs).")
@@ -892,7 +898,7 @@ with tab_find:
                     st.caption(f"Matches: {len(out)}")
                     show_df_view(
                         out,
-                        key_cols=[FREEZER_COL, BOX_LABEL_COL, BOXID_COL, PREFIX_COL, SUFFIX_COL, AMT_COL, DATE_COLLECTED_COL, MEMO_COL],
+                        key_cols=[STUDYCODE_COL, FREEZER_COL, BOX_LABEL_COL, BOXID_COL, PREFIX_COL, SUFFIX_COL, AMT_COL, DATE_COLLECTED_COL, MEMO_COL],
                         height_mobile=320,
                         height_desktop=420,
                         key_prefix="find_fr_exact",
@@ -904,7 +910,7 @@ with tab_find:
                     st.caption(f"Matches: {len(out)}")
                     show_df_view(
                         out,
-                        key_cols=[FREEZER_COL, BOX_LABEL_COL, BOXID_COL, PREFIX_COL, SUFFIX_COL, AMT_COL, DATE_COLLECTED_COL, MEMO_COL],
+                        key_cols=[STUDYCODE_COL, FREEZER_COL, BOX_LABEL_COL, BOXID_COL, PREFIX_COL, SUFFIX_COL, AMT_COL, DATE_COLLECTED_COL, MEMO_COL],
                         height_mobile=320,
                         height_desktop=420,
                         key_prefix="find_fr_contains_view",
@@ -1121,7 +1127,6 @@ with tab_add:
 
             tube_number = normalize_spaces(f"{tube_prefix} {tube_suffix}" if tube_suffix else "")
 
-            # Preview BoxUID + QR
             preview_uid, preview_qr, preview_err = "", "", ""
             try:
                 preview_uid = compute_next_boxuid(ln_view_df, selected_tank_add, rack, hp_hn, drug_code)
@@ -1199,6 +1204,11 @@ with tab_add:
         freezer_id_default = safe_strip(selected_freezer).upper()
 
         with st.form("add_fr_form", clear_on_submit=True):
+            # ✅ NEW StudyCode (from context)
+            study_code_default = safe_strip(selected_display_tab)
+            st.text_input("StudyCode (from context)", value=study_code_default, disabled=True, key="add_fr_studycode_locked")
+            study_code = study_code_default
+
             st.text_input("FreezerID (from context)", value=freezer_id_default, disabled=True, key="add_fr_freezer_locked")
             freezer_id = freezer_id_default
 
@@ -1259,16 +1269,19 @@ with tab_add:
                 def _norm(s: str) -> str:
                     return normalize_spaces(s)
 
+                key_study = _norm(study_code).upper()
                 key_freezer = _norm(freezer_id).upper()
                 key_group = _norm(box_label_group)
                 key_boxid = _norm(boxid)
                 key_prefix = _norm(prefix).upper()
                 key_suffix = _norm(tube_suffix)
 
+                # ✅ Duplicate check includes StudyCode (recommended)
                 if not fr_all_df.empty:
-                    needed = {FREEZER_COL, BOX_LABEL_COL, BOXID_COL, PREFIX_COL, SUFFIX_COL}
+                    needed = {STUDYCODE_COL, FREEZER_COL, BOX_LABEL_COL, BOXID_COL, PREFIX_COL, SUFFIX_COL}
                     if needed.issubset(set(fr_all_df.columns)):
                         dfchk = fr_all_df.copy()
+                        dfchk[STUDYCODE_COL] = dfchk[STUDYCODE_COL].astype(str).map(lambda x: _norm(x).upper())
                         dfchk[FREEZER_COL] = dfchk[FREEZER_COL].astype(str).map(lambda x: _norm(x).upper())
                         dfchk[BOX_LABEL_COL] = dfchk[BOX_LABEL_COL].astype(str).map(_norm)
                         dfchk[BOXID_COL] = dfchk[BOXID_COL].astype(str).map(_norm)
@@ -1276,6 +1289,7 @@ with tab_add:
                         dfchk[SUFFIX_COL] = dfchk[SUFFIX_COL].astype(str).map(_norm)
 
                         dup_mask = (
+                            (dfchk[STUDYCODE_COL] == key_study) &
                             (dfchk[FREEZER_COL] == key_freezer) &
                             (dfchk[BOX_LABEL_COL] == key_group) &
                             (dfchk[BOXID_COL] == key_boxid) &
@@ -1289,6 +1303,7 @@ with tab_add:
                             st.stop()
 
                 data = {
+                    STUDYCODE_COL: study_code,   # ✅ NEW
                     FREEZER_COL: freezer_id,
                     BOXID_COL: boxid,
                     PREFIX_COL: prefix,
@@ -1344,7 +1359,7 @@ with tab_use:
     except Exception:
         pass
 
-    # Clean Freezer zeros and delete matching boxNumber rows (including AD-safe StudyID)
+    # Clean Freezer zeros and delete matching boxNumber rows
     try:
         if not fr_all_df.empty and (AMT_COL in fr_all_df.columns):
             fr_amt = pd.to_numeric(fr_all_df[AMT_COL], errors="coerce").fillna(0).astype(int)
@@ -1523,11 +1538,14 @@ with tab_use:
             if not needed.issubset(set(dfv.columns)):
                 st.error(f"{FREEZER_TAB} missing required columns: {', '.join(sorted(list(needed)))}")
             else:
-                dfv[FREEZER_COL] = dfv[FREEZER_COL].astype(str).map(lambda x: safe_strip(x).upper())
-                dfv[BOX_LABEL_COL] = dfv[BOX_LABEL_COL].astype(str).map(safe_strip)
-                dfv[BOXID_COL] = dfv[BOXID_COL].astype(str).map(safe_strip)
-                dfv[PREFIX_COL] = dfv[PREFIX_COL].astype(str).map(lambda x: safe_strip(x).upper())
-                dfv[SUFFIX_COL] = dfv[SUFFIX_COL].astype(str).map(normalize_spaces)
+                # normalize
+                for col in [STUDYCODE_COL, FREEZER_COL, BOX_LABEL_COL, BOXID_COL, PREFIX_COL, SUFFIX_COL]:
+                    if col not in dfv.columns:
+                        continue
+                    if col in [STUDYCODE_COL, FREEZER_COL, PREFIX_COL]:
+                        dfv[col] = dfv[col].astype(str).map(lambda x: safe_strip(x).upper())
+                    else:
+                        dfv[col] = dfv[col].astype(str).map(normalize_spaces)
                 dfv[AMT_COL] = pd.to_numeric(dfv[AMT_COL], errors="coerce").fillna(0).astype(int)
 
                 scoped = dfv[dfv[FREEZER_COL] == safe_strip(selected_freezer).upper()].copy()
@@ -1573,7 +1591,7 @@ with tab_use:
                             f"Match: Freezer {r.get(FREEZER_COL,'')} | Box {r.get(BOX_LABEL_COL,'')} | "
                             f"BoxID {r.get(BOXID_COL,'')} | TubeAmount {r.get(AMT_COL,'')}"
                         )
-                        show_cols = [FREEZER_COL, BOX_LABEL_COL, BOXID_COL, PREFIX_COL, SUFFIX_COL, AMT_COL, DATE_COLLECTED_COL, MEMO_COL]
+                        show_cols = [STUDYCODE_COL, FREEZER_COL, BOX_LABEL_COL, BOXID_COL, PREFIX_COL, SUFFIX_COL, AMT_COL, DATE_COLLECTED_COL, MEMO_COL]
                         show_cols = [c for c in show_cols if c in match_df.columns]
                         st.dataframe(match_df[show_cols], use_container_width=True, hide_index=True, height=200)
 
