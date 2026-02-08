@@ -17,13 +17,19 @@
 # ✅ After saving Freezer record:
 #    - INSERT a NEW row into boxNumber tab:
 #      * StudyID   = "Prefix + Tube suffix" (from Freezer_Inventory)
-#      * BoxNumber = TubeAmount (from Freezer_Inventory)
+#      * BoxNumber = BoxID used in Freezer_Inventory  ✅ (so boxNumber can be used for max)
 # ✅ When Freezer TubeAmount becomes 0:
 #    - Delete the Freezer_Inventory row
 #    - Delete matching boxNumber row(s) where StudyID == "Prefix + Tube suffix"
 #    - Works in both "Use" flow and auto-clean cleanup
 # ✅ Download CSV file_name includes TubeNumber, Time_stamp, and ShippingTo
 # ✅ Mitigate Google Sheets 429 read quota using caching on reads (TTL)
+#
+# ✅ NEW (your request):
+#    - When adding a new record to Freezer_Inventory:
+#        max BoxID is calculated from tab: boxNumber (column: BoxNumber)
+#    - When adding a new record to LN3:
+#        max BoxID is calculated from tab: LN3 (column: BoxID)
 # ============================================================
 
 import re
@@ -334,7 +340,7 @@ def append_row_by_header(service, tab: str, data: dict):
 def cleanup_zero_amount_rows(service, tab_name: str, df: pd.DataFrame, amount_col: str = AMT_COL) -> List[int]:
     """
     Deletes all rows where amount_col == 0.
-    Returns the list of deleted dataframe row indexes (0-based) that were deleted.
+    Returns list of deleted df indexes (0-based).
     """
     if df is None or df.empty or amount_col not in df.columns:
         return []
@@ -394,12 +400,6 @@ def delete_row_by_index(service, tab_name: str, idx0: int):
         }]},
     ).execute()
 
-def get_current_max_boxid(df_view: pd.DataFrame) -> int:
-    if df_view is None or df_view.empty or BOXID_COL not in df_view.columns:
-        return 0
-    s = pd.to_numeric(df_view[BOXID_COL], errors="coerce").dropna()
-    return int(s.max()) if not s.empty else 0
-
 def compute_next_boxuid(ln_view_df: pd.DataFrame, tank_id: str, rack: int, hp_hn: str, drug_code: str) -> str:
     tank_id = safe_strip(tank_id).upper()
     prefix = f"{tank_id}-R{int(rack):02d}-{hp_hn}-{drug_code}-"
@@ -439,11 +439,16 @@ def ensure_use_log_header(service):
     ])
 
 def ensure_boxnumber_header(service):
+    # boxNumber must have BoxNumber as the numeric "box id" list so it can be used for max.
     set_header_if_blank(service, BOX_TAB, ["StudyID", "BoxNumber"])
 
 def insert_boxnumber_row(service, study_id_value: str, box_number_value: str):
     ensure_boxnumber_header(service)
-    append_row_by_header(service, BOX_TAB, {"StudyID": safe_strip(study_id_value), "BoxNumber": safe_strip(box_number_value)})
+    append_row_by_header(
+        service,
+        BOX_TAB,
+        {"StudyID": safe_strip(study_id_value), "BoxNumber": safe_strip(box_number_value)},
+    )
 
 def delete_boxnumber_rows_by_studyid(service, study_id_value: str) -> int:
     """
@@ -465,9 +470,8 @@ def delete_boxnumber_rows_by_studyid(service, study_id_value: str) -> int:
         return 0
 
     sheet_id = get_sheet_id(service, BOX_TAB)
-
-    # Delete bottom-to-top to prevent index shifting
     hit_idxs.sort(reverse=True)
+
     requests = []
     for idx0 in hit_idxs:
         requests.append({
@@ -475,7 +479,7 @@ def delete_boxnumber_rows_by_studyid(service, study_id_value: str) -> int:
                 "range": {
                     "sheetId": sheet_id,
                     "dimension": "ROWS",
-                    "startIndex": idx0 + 1,   # +1 because header is row 1
+                    "startIndex": idx0 + 1,   # header is row 1
                     "endIndex": idx0 + 2,
                 }
             }
@@ -499,6 +503,39 @@ def freezer_studyid_from_row(df: pd.DataFrame, idx0: int) -> str:
         return normalize_spaces(f"{p} {s}".strip())
     except Exception:
         return ""
+
+# -------------------- NEW (your request): max BoxID source rules --------------------
+def get_current_max_boxid_from_boxnumber() -> int:
+    """
+    For Freezer add: max BoxID is based on boxNumber tab.
+    Uses column 'BoxNumber' as numeric.
+    """
+    try:
+        df = read_tab_cached(BOX_TAB)
+        if df is None or df.empty:
+            return 0
+        if "BoxNumber" not in df.columns:
+            return 0
+        s = pd.to_numeric(df["BoxNumber"], errors="coerce").dropna()
+        return int(s.max()) if not s.empty else 0
+    except Exception:
+        return 0
+
+def get_current_max_boxid_from_ln3() -> int:
+    """
+    For LN add: max BoxID is based on LN3 tab only (across all tanks).
+    Uses column 'BoxID' as numeric.
+    """
+    try:
+        df = read_tab_cached(LN_TAB)
+        if df is None or df.empty:
+            return 0
+        if BOXID_COL not in df.columns:
+            return 0
+        s = pd.to_numeric(df[BOXID_COL], errors="coerce").dropna()
+        return int(s.max()) if not s.empty else 0
+    except Exception:
+        return 0
 
 def build_use_log_row(storage_type, tank_id, rack_number, freezer_id, box_label_group, boxid,
                       prefix, suffix, use_amt, user_initials, shipping_to, memo_in) -> dict:
@@ -637,33 +674,6 @@ def build_box_map() -> dict:
             m[sid] = bx
     return m
 
-def read_column_values(tab: str, col_name: str) -> pd.Series:
-    svc = sheets_service()
-    header = get_header(svc, tab)
-    if not header or col_name not in header:
-        return pd.Series(dtype="float")
-    col_idx = header.index(col_name)
-    a1 = col_to_a1(col_idx)
-    resp = svc.spreadsheets().values().get(
-        spreadsheetId=SPREADSHEET_ID,
-        range=f"{tab}!{a1}2:{a1}",
-        valueRenderOption="UNFORMATTED_VALUE",
-    ).execute()
-    vals = [v[0] for v in resp.get("values", []) if v]
-    return pd.to_numeric(pd.Series(vals), errors="coerce")
-
-def get_current_max_boxnumber_global() -> int:
-    mx = 0
-    for tab in [LN_TAB, FREEZER_TAB]:
-        try:
-            s = read_column_values(tab, BOXID_COL)
-        except Exception:
-            continue
-        s2 = pd.to_numeric(s, errors="coerce").dropna()
-        if not s2.empty:
-            mx = max(mx, int(s2.max()))
-    return max(mx, 0)
-
 # -------------------- Download filename helpers --------------------
 def sanitize_filename_part(s: str, max_len: int = 40) -> str:
     s = safe_strip(s)
@@ -690,44 +700,11 @@ def build_report_filename(df: pd.DataFrame, prefix: str = "report", ext: str = "
     ship_col = "ShippingTo" if "ShippingTo" in df.columns else None
     ts_col = "Time_stamp" if "Time_stamp" in df.columns else None
 
-    if len(df) == 1:
-        row = df.iloc[0]
-        tube = sanitize_filename_part(row.get(tube_col, "NA")) if tube_col else "NA"
-        ship = sanitize_filename_part(row.get(ship_col, "NA")) if ship_col else "NA"
-        ts = timestamp_for_filename(row.get(ts_col, "")) if ts_col else sanitize_filename_part(today_str_ny())
-        return f"{prefix}_Tube-{tube}_Ship-{ship}_TS-{ts}.{ext}"
-
-    tubes = []
-    if tube_col:
-        tubes = [safe_strip(x) for x in df[tube_col].dropna().astype(str).tolist() if safe_strip(x)]
-    tubes_unique = []
-    for t in tubes:
-        if t not in tubes_unique:
-            tubes_unique.append(t)
-
-    tube_part = "MULTI"
-    if tubes_unique:
-        shown = [sanitize_filename_part(t, max_len=18) for t in tubes_unique[:2]]
-        more = f"+{len(tubes_unique)-2}" if len(tubes_unique) > 2 else ""
-        tube_part = "Tubes-" + "_".join(shown) + more
-
-    ship_part = "Ship-MULTI"
-    if ship_col:
-        ships = [safe_strip(x) for x in df[ship_col].dropna().astype(str).tolist() if safe_strip(x)]
-        ships_unique = []
-        for s in ships:
-            if s not in ships_unique:
-                ships_unique.append(s)
-        if len(ships_unique) == 1:
-            ship_part = "Ship-" + sanitize_filename_part(ships_unique[0], max_len=24)
-
-    ts_part = sanitize_filename_part(today_str_ny())
-    if ts_col:
-        ts_vals = [safe_strip(x) for x in df[ts_col].dropna().astype(str).tolist() if safe_strip(x)]
-        if ts_vals:
-            ts_part = timestamp_for_filename(ts_vals[-1])
-
-    return f"{prefix}_{tube_part}_{ship_part}_TS-{ts_part}.{ext}"
+    row = df.iloc[-1]
+    tube = sanitize_filename_part(row.get(tube_col, "NA")) if tube_col else "NA"
+    ship = sanitize_filename_part(row.get(ship_col, "NA")) if ship_col else "NA"
+    ts = timestamp_for_filename(row.get(ts_col, "")) if ts_col else sanitize_filename_part(today_str_ny())
+    return f"{prefix}_Tube-{tube}_Ship-{ship}_TS-{ts}.{ext}"
 
 # ============================================================
 # Preflight (NO DEBUG UI)
@@ -743,12 +720,11 @@ except Exception as e:
 
 required_tabs = [USE_LOG_TAB, LN_TAB, FREEZER_TAB, BOX_TAB]
 study_required = list(TAB_MAP.values())
-
 missing_tabs = [t for t in required_tabs if t not in titles]
 missing_study = [t for t in study_required if t not in titles]
 
 if missing_tabs or missing_study:
-    st.error("❌ Google Sheet is missing required tabs. Please contact the administrator.")
+    st.error("❌ Google Sheet is missing required tabs.")
     if missing_tabs:
         st.caption(f"Missing required tabs: {missing_tabs}")
     if missing_study:
@@ -779,7 +755,6 @@ with c_toggle:
 
 # -------------------- Context Bar --------------------
 ctx1, ctx2, ctx3 = st.columns([1.25, 1, 1])
-
 with ctx1:
     selected_display_tab = st.selectbox("Study", DISPLAY_TABS, index=0, key="ctx_study")
 with ctx2:
@@ -873,7 +848,6 @@ with tab_find:
             except Exception as e:
                 st.error("Failed to load LN inventory.")
                 st.code(err_detail(e), language="text")
-
     else:
         with st.expander("🧊 Freezer Search by BoxLabel_group", expanded=True):
             try:
@@ -888,12 +862,10 @@ with tab_find:
                         df_search[FREEZER_COL] = df_search[FREEZER_COL].astype(str).map(lambda x: safe_strip(x).upper())
 
                     df_search = df_search[df_search[FREEZER_COL] == safe_strip(selected_freezer).upper()].copy()
-
                     df_search[BOX_LABEL_COL] = df_search[BOX_LABEL_COL].astype(str).map(safe_strip)
                     groups = sorted([g for g in df_search[BOX_LABEL_COL].dropna().unique().tolist() if safe_strip(g)])
 
                     mode = st.radio("Mode", ["Exact", "Contains"], horizontal=not st.session_state.mobile_mode, key="find_fr_mode")
-
                     if mode == "Exact":
                         chosen_group = st.selectbox("BoxLabel_group", ["(select)"] + groups, key="find_fr_group_exact")
                         if chosen_group != "(select)":
@@ -960,7 +932,9 @@ with tab_add:
 
             box_label_group = f"{hp_hn}-{drug_code}"
 
-            current_max_boxid = get_current_max_boxid(ln_view_df)
+            # ✅ Your request: LN max is calculated from LN3 (global, not boxNumber)
+            current_max_boxid = get_current_max_boxid_from_ln3()
+
             box_options = ["Open new box"] if current_max_boxid == 0 else ["Use previous box", "Open new box"]
             box_choice = st.radio(
                 "BoxID option",
@@ -1048,8 +1022,10 @@ with tab_add:
         st.caption("Freezer mode → Add to Freezer only (Add to LN hidden).")
 
         default_date = today_str_ny()
-        current_max_boxnumber = get_current_max_boxnumber_global()
-        st.caption(f"Global current max BoxID (LN/Freezer): {current_max_boxnumber if current_max_boxnumber else '(none)'}")
+
+        # ✅ Your request: Freezer max is calculated from boxNumber tab
+        current_max_boxnumber = get_current_max_boxid_from_boxnumber()
+        st.caption(f"Current max BoxNumber (from boxNumber tab): {current_max_boxnumber if current_max_boxnumber else '(none)'}")
 
         freezer_id_default = safe_strip(selected_freezer).upper()
 
@@ -1144,10 +1120,10 @@ with tab_add:
                     append_row_by_header(service, FREEZER_TAB, data)
 
                     # After saving Freezer record -> insert NEW row into boxNumber
+                    # StudyID = Prefix + Tube suffix ; BoxNumber = BoxID (so boxNumber controls max)
                     study_id_value = normalize_spaces(f"{prefix} {tube_suffix}".strip())
-                    box_number_value = str(int(tube_amount))
                     try:
-                        insert_boxnumber_row(service, study_id_value, box_number_value)
+                        insert_boxnumber_row(service, study_id_value, boxid)
                     except Exception as e2:
                         st.warning(f"Saved freezer record, but boxNumber insert failed: {err_detail(e2)}")
 
@@ -1168,7 +1144,7 @@ with tab_use:
     ln_all_df = read_tab_cached(LN_TAB)
     fr_all_df = read_tab_cached(FREEZER_TAB)
 
-    # Auto-clean (optional)
+    # Auto-clean LN (optional)
     try:
         if not ln_all_df.empty:
             deleted_ln = cleanup_zero_amount_rows(service, LN_TAB, ln_all_df, AMT_COL)
@@ -1223,7 +1199,6 @@ with tab_use:
                 dfv["_suffix"] = dfv[TUBE_COL].map(lambda x: split_tube_number(x)[1])
 
                 scoped = dfv[dfv[TANK_COL] == safe_strip(selected_tank).upper()].copy()
-
                 if scoped.empty:
                     st.info(f"No records for {selected_tank}.")
                 else:
@@ -1364,7 +1339,6 @@ with tab_use:
                 dfv[AMT_COL] = pd.to_numeric(dfv[AMT_COL], errors="coerce").fillna(0).astype(int)
 
                 scoped = dfv[dfv[FREEZER_COL] == safe_strip(selected_freezer).upper()].copy()
-
                 if scoped.empty:
                     st.info(f"No records for {selected_freezer}.")
                 else:
@@ -1446,7 +1420,6 @@ with tab_use:
                                 st.error(f"Not enough stock. Current={cur_amount}, Use={int(use_amt)}")
                                 st.stop()
 
-                            # Log to Use_log
                             append_row_by_header(
                                 service,
                                 USE_LOG_TAB,
@@ -1467,13 +1440,9 @@ with tab_use:
                             )
 
                             if new_amount == 0:
-                                # Build StudyID from the row being deleted
                                 study_id_value = freezer_studyid_from_row(fr_all_df, idx0)
-
-                                # Delete freezer row
                                 delete_row_by_index(service, FREEZER_TAB, idx0)
 
-                                # Delete matching boxNumber row(s)
                                 if study_id_value:
                                     try:
                                         delete_boxnumber_rows_by_studyid(service, study_id_value)
@@ -1485,7 +1454,6 @@ with tab_use:
                                 update_amount_by_index(service, FREEZER_TAB, idx0, AMT_COL, new_amount)
                                 st.success(f"Logged ✅ Remaining TubeAmount: {new_amount}")
 
-                            # Session report row
                             ts = now_timestamp_str()
                             st.session_state.usage_final_rows.append(
                                 build_final_report_row(
@@ -1537,9 +1505,8 @@ with tab_history:
 
             show_df_view(tail_df, key_cols=key_cols, height_mobile=360, height_desktop=520, key_prefix="hist_uselog")
 
-            # Download displayed tail_df, filename based on LAST row shown
             csv_bytes = tail_df.to_csv(index=False).encode("utf-8")
-            fname = build_report_filename(tail_df.tail(1), prefix="UseLog", ext="csv")
+            fname = build_report_filename(tail_df, prefix="UseLog", ext="csv")
 
             st.download_button(
                 "⬇️ Download displayed Use_log (CSV)",
@@ -1572,7 +1539,7 @@ with tab_session:
 
         csv_bytes = final_df.to_csv(index=False).encode("utf-8")
 
-        # Session report doesn't store TubeNumber column; build it for filename only
+        # Add TubeNumber for filename only
         name_df = final_df.copy()
         if "TubeNumber" not in name_df.columns and ("Prefix" in name_df.columns) and ("Tube suffix" in name_df.columns):
             name_df["TubeNumber"] = name_df.apply(
@@ -1580,7 +1547,7 @@ with tab_session:
                 axis=1,
             )
 
-        fname = build_report_filename(name_df.tail(1), prefix="SessionReport", ext="csv")
+        fname = build_report_filename(name_df, prefix="SessionReport", ext="csv")
 
         st.download_button(
             "⬇️ Download session report (CSV)",
