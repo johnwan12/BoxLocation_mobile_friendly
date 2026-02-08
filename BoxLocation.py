@@ -10,13 +10,13 @@
 # ✅ Compact Context Bar always visible + Debug/Preflight hidden by default
 # ✅ Sticky header (best-effort CSS)
 # ✅ ADD tab behavior:
-#    - Storage=LN Tank -> only Add to LN
-#    - Storage=Freezer -> only Add to Freezer
+#    - Storage=LN Tank -> only Add to LN (Add to Freezer hidden)
+#    - Storage=Freezer -> only Add to Freezer (Add to LN hidden)
 #    - FreezerID follows Context Freezer (Sammy/Tom/Jerry) and is locked
 # ✅ After saving Freezer record:
 #    - INSERT a NEW row into boxNumber tab:
+#      * StudyID   = "Prefix + Tube suffix" (from Freezer_Inventory)
 #      * BoxNumber = BoxID used in Freezer_Inventory
-#      * BoxID     = "Prefix + Tube suffix"
 # ============================================================
 
 import re
@@ -119,7 +119,7 @@ USE_LOG_TAB = "Use_log"
 
 # Shared columns
 BOX_LABEL_COL = "BoxLabel_group"
-BOXID_COL = "BoxID"
+BOXID_COL = "BoxID"         # used in LN3 and Freezer_Inventory
 AMT_COL = "TubeAmount"
 MEMO_COL = "Memo"
 
@@ -403,18 +403,22 @@ def ensure_use_log_header(service):
         "Use", "User", "Time_stamp", "ShippingTo", "Memo",
     ])
 
+# ✅ boxNumber sheet now uses: StudyID + BoxNumber
 def ensure_boxnumber_header(service):
-    # Only sets if header row is blank
-    set_header_if_blank(service, BOX_TAB, ["BoxNumber", "BoxID"])
+    set_header_if_blank(service, BOX_TAB, ["StudyID", "BoxNumber"])
 
-def insert_boxnumber_row(service, box_number: str, tube_id: str):
+def insert_boxnumber_row(service, study_id_value: str, box_number: str):
     """
     INSERT (append) a NEW row into boxNumber with:
-      - BoxNumber = box_number
-      - BoxID     = tube_id ("Prefix Tube suffix")
+      - StudyID   = Prefix + Tube suffix
+      - BoxNumber = BoxID used in Freezer_Inventory (your "box number")
     """
     ensure_boxnumber_header(service)
-    append_row_by_header(service, BOX_TAB, {"BoxNumber": safe_strip(box_number), "BoxID": safe_strip(tube_id)})
+    append_row_by_header(
+        service,
+        BOX_TAB,
+        {"StudyID": safe_strip(study_id_value), "BoxNumber": safe_strip(box_number)},
+    )
 
 def build_use_log_row(storage_type, tank_id, rack_number, freezer_id, box_label_group, boxid,
                       prefix, suffix, use_amt, user_initials, shipping_to, memo_in) -> dict:
@@ -570,6 +574,7 @@ def read_column_values(tab: str, col_name: str) -> pd.Series:
 
 def get_current_max_boxnumber_global() -> int:
     series_list = []
+    # ✅ if you use boxNumber!BoxNumber as global counter
     try:
         series_list.append(read_column_values(BOX_TAB, "BoxNumber"))
     except Exception:
@@ -627,7 +632,6 @@ if connected_ok and not missing_tabs and not missing_study:
 # ============================================================
 # Sticky Header: title + status + context + mode tabs
 # ============================================================
-# If your "first title is not showing", this forces a visible title even if CSS sticky misbehaves.
 st.title("📦 Sample Inventory")
 
 c_status, c_toggles = st.columns([1, 1])
@@ -677,8 +681,6 @@ with ctx3:
     else:
         selected_freezer = st.selectbox("Freezer", ["Sammy", "Tom", "Jerry"], index=0, key="ctx_freezer")
         selected_tank = None
-
-STORAGE_ID = selected_tank if STORAGE_TYPE == "LN Tank" else selected_freezer
 
 # ============================================================
 # Top-level mode tabs
@@ -1030,10 +1032,11 @@ with tab_add:
                 try:
                     append_row_by_header(service, FREEZER_TAB, data)
 
-                    # ✅ After saving Freezer record: INSERT a new row into boxNumber
-                    tube_id = normalize_spaces(f"{prefix} {tube_suffix}".strip())
+                    # ✅ After saving Freezer record: copy Prefix + Tube suffix -> boxNumber!StudyID
+                    #    and use Freezer BoxID as boxNumber!BoxNumber
+                    study_id_value = normalize_spaces(f"{prefix} {tube_suffix}".strip())
                     try:
-                        insert_boxnumber_row(service, box_number=boxid, tube_id=tube_id)
+                        insert_boxnumber_row(service, study_id_value=study_id_value, box_number=boxid)
                     except Exception as e2:
                         st.warning(f"Saved freezer record, but boxNumber insert failed: {err_detail(e2)}")
 
