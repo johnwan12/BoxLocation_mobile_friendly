@@ -1352,4 +1352,43 @@ with tab_history:
             tail_df = use_log_df.tail(n)
 
             key_cols = [
-                "Time_stamp",_
+                "Time_stamp", "StorageType", "TankID", "RackNumber", "FreezerID",
+                "BoxLabel_group", "BoxID", "TubeNumber", "Use", "User", "ShippingTo", "Memo"
+            ]
+            show_df_view(tail_df, key_cols=key_cols, height_mobile=360, height_desktop=520, key_prefix="hist_uselog")
+    except Exception as e:
+        st.error("Unable to read Use_log.")
+        st.code(err_detail(e), language="text")
+
+# ============================================================
+# SESSION REPORT
+# ============================================================
+with tab_session:
+    st.subheader("Session Report")
+    st.caption("This report includes only usage you logged during the current session (browser session).")
+
+    final_cols = [
+        "StorageType", "StorageID", "BoxLabel_group", "BoxID",
+        "Prefix", "Tube suffix", "Use", "User", "Time_stamp",
+        "ShippingTo", "Memo",
+    ]
+
+    if st.session_state.usage_final_rows:
+        final_df = pd.DataFrame(st.session_state.usage_final_rows).reindex(columns=final_cols, fill_value="")
+        show_df_view(final_df, key_cols=final_cols, height_mobile=360, height_desktop=520, key_prefix="session_final")
+
+        csv_bytes = final_df.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "⬇️ Download session report (CSV)",
+            data=csv_bytes,
+            file_name="final_report_session.csv",
+            mime="text/csv",
+            key="download_session_report",
+        )
+
+        if st.button("🧹 Clear session report", key="clear_session_report"):
+            st.session_state.usage_final_rows = []
+            st.success("Session report cleared (Use_log remains saved).")
+            st.rerun()
+    else:
+        st.info("No usage logged in this session yet.")
