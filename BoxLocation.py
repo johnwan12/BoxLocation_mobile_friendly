@@ -5,6 +5,9 @@
 # ✅ FIND tab:
 #    - Storage=LN Tank: show LN Inventory Table (selected tank)
 #    - Storage=Freezer: show Freezer Search by BoxLabel_group (selected freezer)
+# ✅ Box Location expander:
+#    - Storage=Freezer: title shows "📦 {FREEZER}: Box Location" and expanded by default
+#    - Storage=LN Tank: minimized/collapsed by default
 # ✅ Workflow tabs: Find / Add / Use / History / Session Report
 # ✅ Compact Context Bar always visible
 # ✅ Sticky header (best-effort CSS)
@@ -21,15 +24,12 @@
 # ✅ When Freezer TubeAmount becomes 0:
 #    - Delete the Freezer_Inventory row
 #    - Delete matching boxNumber row(s) where StudyID == "Prefix + Tube suffix"
-#    - Works in both "Use" flow and auto-clean cleanup
 # ✅ Download CSV file_name includes TubeNumber, Time_stamp, and ShippingTo
 # ✅ Mitigate Google Sheets 429 read quota using caching on reads (TTL)
 #
-# ✅ NEW (your request):
-#    - When adding a new record to Freezer_Inventory:
-#        max BoxID is calculated from tab: boxNumber (column: BoxNumber)
-#    - When adding a new record to LN3:
-#        max BoxID is calculated from tab: LN3 (column: BoxID)
+# ✅ Max BoxID rules (your request):
+#    - Freezer add: max BoxID comes from boxNumber!BoxNumber
+#    - LN add:      max BoxID comes from LN3!BoxID
 # ============================================================
 
 import re
@@ -338,10 +338,6 @@ def append_row_by_header(service, tab: str, data: dict):
     ).execute()
 
 def cleanup_zero_amount_rows(service, tab_name: str, df: pd.DataFrame, amount_col: str = AMT_COL) -> List[int]:
-    """
-    Deletes all rows where amount_col == 0.
-    Returns list of deleted df indexes (0-based).
-    """
     if df is None or df.empty or amount_col not in df.columns:
         return []
     amounts = pd.to_numeric(df[amount_col], errors="coerce").fillna(0).astype(int)
@@ -439,7 +435,6 @@ def ensure_use_log_header(service):
     ])
 
 def ensure_boxnumber_header(service):
-    # boxNumber must have BoxNumber as the numeric "box id" list so it can be used for max.
     set_header_if_blank(service, BOX_TAB, ["StudyID", "BoxNumber"])
 
 def insert_boxnumber_row(service, study_id_value: str, box_number_value: str):
@@ -451,12 +446,7 @@ def insert_boxnumber_row(service, study_id_value: str, box_number_value: str):
     )
 
 def delete_boxnumber_rows_by_studyid(service, study_id_value: str) -> int:
-    """
-    Delete ALL rows in boxNumber where StudyID == study_id_value (exact match).
-    Returns number of rows deleted.
-    """
     ensure_boxnumber_header(service)
-
     df = read_tab_cached(BOX_TAB)
     if df is None or df.empty or "StudyID" not in df.columns:
         return 0
@@ -479,7 +469,7 @@ def delete_boxnumber_rows_by_studyid(service, study_id_value: str) -> int:
                 "range": {
                     "sheetId": sheet_id,
                     "dimension": "ROWS",
-                    "startIndex": idx0 + 1,   # header is row 1
+                    "startIndex": idx0 + 1,
                     "endIndex": idx0 + 2,
                 }
             }
@@ -494,9 +484,6 @@ def delete_boxnumber_rows_by_studyid(service, study_id_value: str) -> int:
     return len(hit_idxs)
 
 def freezer_studyid_from_row(df: pd.DataFrame, idx0: int) -> str:
-    """
-    StudyID = 'Prefix + Tube suffix' for a freezer row index.
-    """
     try:
         p = safe_strip(df.loc[idx0, PREFIX_COL]).upper()
         s = safe_strip(df.loc[idx0, SUFFIX_COL])
@@ -504,12 +491,8 @@ def freezer_studyid_from_row(df: pd.DataFrame, idx0: int) -> str:
     except Exception:
         return ""
 
-# -------------------- NEW (your request): max BoxID source rules --------------------
+# -------------------- Max BoxID rules --------------------
 def get_current_max_boxid_from_boxnumber() -> int:
-    """
-    For Freezer add: max BoxID is based on boxNumber tab.
-    Uses column 'BoxNumber' as numeric.
-    """
     try:
         df = read_tab_cached(BOX_TAB)
         if df is None or df.empty:
@@ -522,10 +505,6 @@ def get_current_max_boxid_from_boxnumber() -> int:
         return 0
 
 def get_current_max_boxid_from_ln3() -> int:
-    """
-    For LN add: max BoxID is based on LN3 tab only (across all tanks).
-    Uses column 'BoxID' as numeric.
-    """
     try:
         df = read_tab_cached(LN_TAB)
         if df is None or df.empty:
@@ -707,7 +686,7 @@ def build_report_filename(df: pd.DataFrame, prefix: str = "report", ext: str = "
     return f"{prefix}_Tube-{tube}_Ship-{ship}_TS-{ts}.{ext}"
 
 # ============================================================
-# Preflight (NO DEBUG UI)
+# Preflight
 # ============================================================
 service = sheets_service()
 
@@ -780,7 +759,11 @@ tab_find, tab_add, tab_use, tab_history, tab_session = st.tabs(
 with tab_find:
     st.subheader("Find / Locate")
 
-    with st.expander("📦 SAMMY: Box Location", expanded=True):
+    # ✅ Your request: minimized when LN Tank is selected
+    boxloc_title = f"📦 {safe_strip(selected_freezer).upper()}: Box Location" if STORAGE_TYPE == "Freezer" else "📦 Sammy Box Location"
+    boxloc_expanded = True if STORAGE_TYPE == "Freezer" else False
+
+    with st.expander(boxloc_title, expanded=boxloc_expanded):
         tab_name = TAB_MAP[selected_display_tab]
         try:
             df = read_tab_cached(tab_name)
@@ -848,6 +831,7 @@ with tab_find:
             except Exception as e:
                 st.error("Failed to load LN inventory.")
                 st.code(err_detail(e), language="text")
+
     else:
         with st.expander("🧊 Freezer Search by BoxLabel_group", expanded=True):
             try:
@@ -932,7 +916,7 @@ with tab_add:
 
             box_label_group = f"{hp_hn}-{drug_code}"
 
-            # ✅ Your request: LN max is calculated from LN3 (global, not boxNumber)
+            # ✅ LN max from LN3
             current_max_boxid = get_current_max_boxid_from_ln3()
 
             box_options = ["Open new box"] if current_max_boxid == 0 else ["Use previous box", "Open new box"]
@@ -1023,7 +1007,7 @@ with tab_add:
 
         default_date = today_str_ny()
 
-        # ✅ Your request: Freezer max is calculated from boxNumber tab
+        # ✅ Freezer max from boxNumber
         current_max_boxnumber = get_current_max_boxid_from_boxnumber()
         st.caption(f"Current max BoxNumber (from boxNumber tab): {current_max_boxnumber if current_max_boxnumber else '(none)'}")
 
@@ -1120,7 +1104,6 @@ with tab_add:
                     append_row_by_header(service, FREEZER_TAB, data)
 
                     # After saving Freezer record -> insert NEW row into boxNumber
-                    # StudyID = Prefix + Tube suffix ; BoxNumber = BoxID (so boxNumber controls max)
                     study_id_value = normalize_spaces(f"{prefix} {tube_suffix}".strip())
                     try:
                         insert_boxnumber_row(service, study_id_value, boxid)
@@ -1144,7 +1127,6 @@ with tab_use:
     ln_all_df = read_tab_cached(LN_TAB)
     fr_all_df = read_tab_cached(FREEZER_TAB)
 
-    # Auto-clean LN (optional)
     try:
         if not ln_all_df.empty:
             deleted_ln = cleanup_zero_amount_rows(service, LN_TAB, ln_all_df, AMT_COL)
@@ -1154,7 +1136,6 @@ with tab_use:
     except Exception:
         pass
 
-    # Freezer auto-clean + boxNumber cleanup
     try:
         if not fr_all_df.empty and (AMT_COL in fr_all_df.columns):
             fr_amt = pd.to_numeric(fr_all_df[AMT_COL], errors="coerce").fillna(0).astype(int)
@@ -1442,13 +1423,11 @@ with tab_use:
                             if new_amount == 0:
                                 study_id_value = freezer_studyid_from_row(fr_all_df, idx0)
                                 delete_row_by_index(service, FREEZER_TAB, idx0)
-
                                 if study_id_value:
                                     try:
                                         delete_boxnumber_rows_by_studyid(service, study_id_value)
                                     except Exception:
                                         pass
-
                                 st.success("Logged ✅ Saved to Use_log. TubeAmount reached 0 → row deleted.")
                             else:
                                 update_amount_by_index(service, FREEZER_TAB, idx0, AMT_COL, new_amount)
@@ -1474,7 +1453,7 @@ with tab_use:
                             st.rerun()
 
 # ============================================================
-# HISTORY (Use_log viewer)
+# HISTORY
 # ============================================================
 with tab_history:
     st.subheader("Use_log History")
@@ -1489,25 +1468,13 @@ with tab_history:
             tail_df = use_log_df.tail(n)
 
             key_cols = [
-                "Time_stamp",
-                "StorageType",
-                "TankID",
-                "RackNumber",
-                "FreezerID",
-                "BoxLabel_group",
-                "BoxID",
-                "TubeNumber",
-                "Use",
-                "User",
-                "ShippingTo",
-                "Memo",
+                "Time_stamp", "StorageType", "TankID", "RackNumber", "FreezerID",
+                "BoxLabel_group", "BoxID", "TubeNumber", "Use", "User", "ShippingTo", "Memo",
             ]
-
             show_df_view(tail_df, key_cols=key_cols, height_mobile=360, height_desktop=520, key_prefix="hist_uselog")
 
             csv_bytes = tail_df.to_csv(index=False).encode("utf-8")
             fname = build_report_filename(tail_df, prefix="UseLog", ext="csv")
-
             st.download_button(
                 "⬇️ Download displayed Use_log (CSV)",
                 data=csv_bytes,
@@ -1539,7 +1506,6 @@ with tab_session:
 
         csv_bytes = final_df.to_csv(index=False).encode("utf-8")
 
-        # Add TubeNumber for filename only
         name_df = final_df.copy()
         if "TubeNumber" not in name_df.columns and ("Prefix" in name_df.columns) and ("Tube suffix" in name_df.columns):
             name_df["TubeNumber"] = name_df.apply(
