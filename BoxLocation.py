@@ -6,9 +6,11 @@
 #    - Storage=LN Tank: show LN Inventory Table (selected tank)
 #    - Storage=Freezer: show Freezer Search by BoxLabel_group (selected freezer)
 # ✅ FIND focus (your new request):
-#    - Storage=Freezer AND Freezer in {Tom, Jerry}: Freezer Search is shown FIRST, highlighted, and auto-scrolled (best-effort)
+#    - Storage=Freezer AND Freezer in {Tom, Jerry}: Freezer Search is shown FIRST, highlighted,
+#      and auto-scrolled ONCE per freezer selection (best-effort) ✅ FIXED
 # ✅ Box Location area:
-#    - Storage=Freezer: ALWAYS visible (not an expander) with title "📦 {FREEZER}: Box Location"
+#    - Storage=Freezer: ALWAYS visible (not an expander) with title "📦 {FREEZER}: Box Location" ✅ FIXED
+#      + Adds "Jump to Box Location" button so it never feels hidden ✅
 #    - Storage=LN Tank: expander collapsed by default
 # ✅ Workflow tabs: Find / Add / Use / History / Session Report
 # ✅ Compact Context Bar always visible
@@ -426,8 +428,8 @@ def compute_next_boxuid(ln_view_df: pd.DataFrame, tank_id: str, rack: int, hp_hn
     tank_id = safe_strip(tank_id).upper()
     prefix = f"{tank_id}-R{int(rack):02d}-{hp_hn}-{drug_code}-"
     max_n = 0
-    if ln_view_df is not None and (not ln_view_df.empty) and (BOXUID_COL in ln_view_df.columns):
-        for v in ln_view_df[BOXUID_COL].dropna().astype(str):
+    if ln_view_df is not None and (not ln_view_df.empty) and ("BoxUID" in ln_view_df.columns):
+        for v in ln_view_df["BoxUID"].dropna().astype(str):
             s = v.strip()
             if s.startswith(prefix) and re.search(r"-(\d{2})$", s):
                 try:
@@ -803,6 +805,13 @@ with tab_find:
             height=0,
         )
 
+    # ✅ FIX: auto-scroll only ONCE per freezer selection (prevents Box Location feeling "hidden")
+    def scroll_once(anchor_id: str, once_key: str):
+        if st.session_state.get(once_key, False):
+            return
+        st.session_state[once_key] = True
+        scroll_into_view(anchor_id)
+
     focus_freezer_search = should_focus_freezer_search()
 
     def render_freezer_search():
@@ -856,27 +865,46 @@ with tab_find:
                 else:
                     st.info("Type a search term to filter.")
         except Exception:
-            st.error("Freezer search failed.")
+            st.error("Freezer search failed. If this persists, wait 30–60 seconds and retry.")
 
     # --- FREEZER MODE: Focus Freezer Search FIRST (Tom/Jerry), then Box Location always visible ---
     if STORAGE_TYPE == "Freezer":
-        # Anchor to scroll to the focused section
+        # Outer anchor
         st.markdown("<div id='freezer_search_anchor'></div>", unsafe_allow_html=True)
 
         if focus_freezer_search:
             st.markdown("<div class='focus-card'>", unsafe_allow_html=True)
+            # Inner anchor improves scroll reliability
+            st.markdown("<div id='freezer_search_anchor_inner'></div>", unsafe_allow_html=True)
+
             st.markdown("### 🧊 Freezer Search by BoxLabel_group")
             st.caption("Focused view (Tom/Jerry) — this section stays on top.")
+
+            # ✅ Always provide a jump so Box Location is never "hidden"
+            st.button(
+                "⬇️ Jump to Box Location",
+                on_click=lambda: scroll_into_view("boxloc_anchor"),
+                key="jump_boxloc_btn",
+            )
+
             render_freezer_search()
             st.markdown("</div>", unsafe_allow_html=True)
-            scroll_into_view("freezer_search_anchor")
+
+            # ✅ Scroll only once per freezer selection
+            scroll_once(
+                "freezer_search_anchor_inner",
+                f"did_scroll_freezer_search_{safe_strip(selected_freezer)}",
+            )
         else:
             with st.expander("🧊 Freezer Search by BoxLabel_group", expanded=True):
                 render_freezer_search()
 
-        # Box Location always visible (cannot be minimized)
+        # --- Box Location: ALWAYS visible ---
+        st.markdown("<div id='boxloc_anchor'></div>", unsafe_allow_html=True)
+
         boxloc_title = f"📦 {safe_strip(selected_freezer).upper()}: Box Location"
-        st.markdown(f"<div class='boxloc-card'><h3>{boxloc_title}</h3></div>", unsafe_allow_html=True)
+        st.markdown("<div class='boxloc-card'>", unsafe_allow_html=True)
+        st.markdown(f"<h3 style='margin:0'>{boxloc_title}</h3>", unsafe_allow_html=True)
 
         tab_name = TAB_MAP[selected_display_tab]
         try:
@@ -907,7 +935,9 @@ with tab_find:
                         else:
                             st.success(f"BoxNumber: {box}")
         except Exception:
-            st.error("Box Location failed.")
+            st.error("Box Location failed. If this persists, wait 30–60 seconds and retry.")
+
+        st.markdown("</div>", unsafe_allow_html=True)
 
     # --- LN MODE: Box Location collapsed by default, then LN table ---
     else:
@@ -942,7 +972,7 @@ with tab_find:
                             else:
                                 st.success(f"BoxNumber: {box}")
             except Exception:
-                st.error("Box Location failed.")
+                st.error("Box Location failed. If this persists, wait 30–60 seconds and retry.")
 
         with st.expander(f"🧊 LN Inventory Table ({selected_tank})", expanded=True):
             try:
@@ -976,7 +1006,7 @@ with tab_find:
                                 key_prefix="find_ln_table",
                             )
             except Exception:
-                st.error("Failed to load LN inventory.")
+                st.error("Failed to load LN inventory. If this persists, wait 30–60 seconds and retry.")
 
 # ============================================================
 # ADD
@@ -1580,7 +1610,7 @@ with tab_history:
             )
 
     except Exception:
-        st.error("Unable to read Use_log.")
+        st.error("Unable to read Use_log. If this persists, wait 30–60 seconds and retry.")
 
 # ============================================================
 # SESSION REPORT
