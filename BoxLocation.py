@@ -780,7 +780,7 @@ tab_find, tab_add, tab_use, tab_history, tab_session = st.tabs(
 with tab_find:
     st.subheader("Find / Locate")
 
-    with st.expander("📦 Box Location", expanded=True):
+    with st.expander("📦 SAMMY: Box Location", expanded=True):
         tab_name = TAB_MAP[selected_display_tab]
         try:
             df = read_tab_cached(tab_name)
