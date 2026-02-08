@@ -5,12 +5,10 @@
 # ✅ FIND tab:
 #    - Storage=LN Tank: show LN Inventory Table (selected tank)
 #    - Storage=Freezer: show Freezer Search by BoxLabel_group (selected freezer)
-# ✅ FIND focus (your new request):
-#    - Storage=Freezer AND Freezer in {Tom, Jerry}: Freezer Search is shown FIRST, highlighted,
-#      and auto-scrolled ONCE per freezer selection (best-effort) ✅ FIXED
+# ✅ FIND focus:
+#    - Storage=Freezer AND Freezer in {Tom, Jerry}: Freezer Search is shown FIRST, highlighted, and auto-scrolled (best-effort)
 # ✅ Box Location area:
-#    - Storage=Freezer: ALWAYS visible (not an expander) with title "📦 {FREEZER}: Box Location" ✅ FIXED
-#      + Adds "Jump to Box Location" button so it never feels hidden ✅
+#    - Storage=Freezer: ALWAYS visible (NOT hidden), not an expander, with title "📦 {FREEZER}: Box Location"
 #    - Storage=LN Tank: expander collapsed by default
 # ✅ Workflow tabs: Find / Add / Use / History / Session Report
 # ✅ Compact Context Bar always visible
@@ -19,16 +17,23 @@
 # ✅ fetch_bytes() disables proxies to reduce SSL WRONG_VERSION_NUMBER issues
 # ✅ After saving Freezer record:
 #    - INSERT a NEW row into boxNumber tab:
-#      * StudyID   = "Prefix + Tube suffix"
-#      * BoxNumber = BoxID used in Freezer_Inventory ✅ (so boxNumber can be used for max)
+#      * StudyID   = "Prefix + Tube suffix" (or for AD: "AD Prefix TubeSuffix" to avoid collisions)
+#      * BoxNumber = BoxID used in Freezer_Inventory ✅
 # ✅ When Freezer TubeAmount becomes 0:
 #    - Delete the Freezer_Inventory row
-#    - Delete matching boxNumber row(s) where StudyID == "Prefix + Tube suffix"
+#    - Delete matching boxNumber row(s) where StudyID matches same rule
 # ✅ Download CSV file_name includes TubeNumber, Time_stamp, and ShippingTo
 # ✅ Mitigate Google Sheets 429 read quota using caching on reads (TTL)
-# ✅ Max BoxID rules (your request):
+# ✅ Max BoxID rules:
 #    - Freezer add: max BoxID comes from boxNumber!BoxNumber
 #    - LN add:      max BoxID comes from LN3!BoxID
+#
+# ✅ NEW STUDY: AD
+#    - Study dropdown includes "AD" and TAB_MAP["AD"] = "AD" (must exist as a Google Sheet tab)
+#    - BoxLabel_group: AD+ / AD-
+#    - Tube label: Prefix auto (01=ADP for AD+, 02=ADN for AD-) + Tube suffix 001-999
+#    - Freezer boxNumber StudyID is collision-safe: "AD {Prefix} {Tube suffix}"
+#    - Other than naming differences, processes are the same.
 # ============================================================
 
 import re
@@ -144,12 +149,13 @@ if "mobile_mode" not in st.session_state:
     st.session_state.mobile_mode = True
 
 # -------------------- Constants --------------------
-DISPLAY_TABS = ["Cocaine", "Cannabis", "HIV-neg-nondrug", "HIV+nondrug"]
+DISPLAY_TABS = ["Cocaine", "Cannabis", "HIV-neg-nondrug", "HIV+nondrug", "AD"]
 TAB_MAP = {
     "Cocaine": "cocaine",
     "Cannabis": "cannabis",
     "HIV-neg-nondrug": "HIV-neg-nondrug",
     "HIV+nondrug": "HIV+nondrug",
+    "AD": "AD",  # must match Google Sheet tab title
 }
 
 BOX_TAB = "boxNumber"
@@ -182,6 +188,14 @@ COLLECTED_BY_COL = "Collected By"
 
 HIV_CODE = {"HIV+": "HP", "HIV-": "HN"}
 DRUG_CODE = {"Cocaine": "COC", "Cannabis": "CAN", "Poly": "POL", "NON-DRUG": "NON-DRUG"}
+
+# -------------------- AD naming --------------------
+AD_GROUPS = ["AD+", "AD-"]
+AD_PREFIX_MAP = {"AD+": "01", "AD-": "02"}  # 01=ADP, 02=ADN
+AD_UID_MAP = {"AD+": "ADP", "AD-": "ADN"}   # used in BoxUID encoding
+AD_SUFFIX_REGEX = r"^\d{3}$"                # 001-999
+AD_SUFFIX_MIN = 1
+AD_SUFFIX_MAX = 999
 
 QR_PX = 118
 SPREADSHEET_ID = st.secrets["connections"]["gsheets"]["spreadsheet"]
@@ -237,6 +251,38 @@ def split_tube_number(t: str) -> Tuple[str, str]:
         return parts[0], ""
     return parts[0], parts[1]
 
+def is_ad_context(display_study: str, box_label_group: str = "") -> bool:
+    if safe_strip(display_study) == "AD":
+        return True
+    g = safe_strip(box_label_group)
+    return g in AD_GROUPS or g.upper().startswith("AD")
+
+def validate_ad_suffix_or_stop(tube_suffix: str):
+    tube_suffix = safe_strip(tube_suffix)
+    if not tube_suffix:
+        st.error("Tube suffix is required.")
+        st.stop()
+    if not re.match(AD_SUFFIX_REGEX, tube_suffix):
+        st.error("Tube suffix must be 3 digits (001-999).")
+        st.stop()
+    n = int(tube_suffix)
+    if n < AD_SUFFIX_MIN or n > AD_SUFFIX_MAX:
+        st.error("Tube suffix must be between 001 and 999.")
+        st.stop()
+
+def make_studyid_for_boxnumber(display_study: str, prefix: str, tube_suffix: str, box_label_group: str = "") -> str:
+    """
+    For AD: collision-safe StudyID = "AD {Prefix} {Tube suffix}" (e.g., "AD 01 007")
+    For others: existing StudyID = "{Prefix} {Tube suffix}"
+    """
+    display_study = safe_strip(display_study)
+    prefix = safe_strip(prefix).upper()
+    tube_suffix = safe_strip(tube_suffix)
+    box_label_group = safe_strip(box_label_group)
+    if is_ad_context(display_study, box_label_group):
+        return normalize_spaces(f"AD {prefix} {tube_suffix}".strip())
+    return normalize_spaces(f"{prefix} {tube_suffix}".strip())
+
 def qr_link_for_boxuid(box_uid: str, px: int = QR_PX) -> str:
     text = urllib.parse.quote(box_uid, safe="")
     return f"https://quickchart.io/qr?text={text}&size={px}&ecLevel=Q&margin=1"
@@ -249,7 +295,6 @@ def fetch_bytes(url: str, timeout: int = 12) -> bytes:
         return resp.read()
 
 def err_detail(e: Exception) -> str:
-    # kept for internal logging; we don't display raw error in UI (NO DEBUG)
     try:
         if isinstance(e, HttpError):
             content = getattr(e, "content", b"")
@@ -426,10 +471,12 @@ def delete_row_by_index(service, tab_name: str, idx0: int):
 
 def compute_next_boxuid(ln_view_df: pd.DataFrame, tank_id: str, rack: int, hp_hn: str, drug_code: str) -> str:
     tank_id = safe_strip(tank_id).upper()
+    hp_hn = safe_strip(hp_hn).upper()
+    drug_code = safe_strip(drug_code).upper()
     prefix = f"{tank_id}-R{int(rack):02d}-{hp_hn}-{drug_code}-"
     max_n = 0
-    if ln_view_df is not None and (not ln_view_df.empty) and ("BoxUID" in ln_view_df.columns):
-        for v in ln_view_df["BoxUID"].dropna().astype(str):
+    if ln_view_df is not None and (not ln_view_df.empty) and (BOXUID_COL in ln_view_df.columns):
+        for v in ln_view_df[BOXUID_COL].dropna().astype(str):
             s = v.strip()
             if s.startswith(prefix) and re.search(r"-(\d{2})$", s):
                 try:
@@ -515,7 +562,9 @@ def freezer_studyid_from_row(df: pd.DataFrame, idx0: int) -> str:
     try:
         p = safe_strip(df.loc[idx0, PREFIX_COL]).upper()
         s = safe_strip(df.loc[idx0, SUFFIX_COL])
-        return normalize_spaces(f"{p} {s}".strip())
+        g = safe_strip(df.loc[idx0, BOX_LABEL_COL]) if (BOX_LABEL_COL in df.columns) else ""
+        # AD rows -> "AD {Prefix} {Suffix}"
+        return make_studyid_for_boxnumber(display_study="", prefix=p, tube_suffix=s, box_label_group=g)
     except Exception:
         return ""
 
@@ -789,7 +838,6 @@ with tab_find:
         return (STORAGE_TYPE == "Freezer") and (safe_strip(selected_freezer) in ["Tom", "Jerry"])
 
     def scroll_into_view(anchor_id: str):
-        # Best-effort: no harm if blocked.
         components.html(
             f"""
             <script>
@@ -805,7 +853,6 @@ with tab_find:
             height=0,
         )
 
-    # ✅ FIX: auto-scroll only ONCE per freezer selection (prevents Box Location feeling "hidden")
     def scroll_once(anchor_id: str, once_key: str):
         if st.session_state.get(once_key, False):
             return
@@ -851,7 +898,7 @@ with tab_find:
                         key_prefix="find_fr_exact",
                     )
             else:
-                q = st.text_input("BoxLabel_group contains…", placeholder="e.g., HP-COC", key="find_fr_contains").strip()
+                q = st.text_input("BoxLabel_group contains…", placeholder="e.g., HP-COC / AD+", key="find_fr_contains").strip()
                 if q:
                     out = df_search[df_search[BOX_LABEL_COL].astype(str).str.lower().str.contains(q.lower(), na=False)].copy()
                     st.caption(f"Matches: {len(out)}")
@@ -865,46 +912,35 @@ with tab_find:
                 else:
                     st.info("Type a search term to filter.")
         except Exception:
-            st.error("Freezer search failed. If this persists, wait 30–60 seconds and retry.")
+            st.error("Freezer search failed.")
 
-    # --- FREEZER MODE: Focus Freezer Search FIRST (Tom/Jerry), then Box Location always visible ---
+    # --- FREEZER MODE: Focus Freezer Search FIRST (Tom/Jerry), Box Location ALWAYS visible ---
     if STORAGE_TYPE == "Freezer":
-        # Outer anchor
         st.markdown("<div id='freezer_search_anchor'></div>", unsafe_allow_html=True)
 
         if focus_freezer_search:
             st.markdown("<div class='focus-card'>", unsafe_allow_html=True)
-            # Inner anchor improves scroll reliability
             st.markdown("<div id='freezer_search_anchor_inner'></div>", unsafe_allow_html=True)
 
             st.markdown("### 🧊 Freezer Search by BoxLabel_group")
             st.caption("Focused view (Tom/Jerry) — this section stays on top.")
-
-            # ✅ Always provide a jump so Box Location is never "hidden"
             st.button(
                 "⬇️ Jump to Box Location",
                 on_click=lambda: scroll_into_view("boxloc_anchor"),
                 key="jump_boxloc_btn",
             )
-
             render_freezer_search()
             st.markdown("</div>", unsafe_allow_html=True)
 
-            # ✅ Scroll only once per freezer selection
-            scroll_once(
-                "freezer_search_anchor_inner",
-                f"did_scroll_freezer_search_{safe_strip(selected_freezer)}",
-            )
+            scroll_once("freezer_search_anchor_inner", f"did_scroll_freezer_search_{safe_strip(selected_freezer)}")
         else:
             with st.expander("🧊 Freezer Search by BoxLabel_group", expanded=True):
                 render_freezer_search()
 
-        # --- Box Location: ALWAYS visible ---
+        # --- Box Location: ALWAYS visible (never hidden) ---
         st.markdown("<div id='boxloc_anchor'></div>", unsafe_allow_html=True)
-
-        boxloc_title = f"📦 {safe_strip(selected_freezer).upper()}: Box Location"
         st.markdown("<div class='boxloc-card'>", unsafe_allow_html=True)
-        st.markdown(f"<h3 style='margin:0'>{boxloc_title}</h3>", unsafe_allow_html=True)
+        st.markdown(f"<h3 style='margin:0'>📦 {safe_strip(selected_freezer).upper()}: Box Location</h3>", unsafe_allow_html=True)
 
         tab_name = TAB_MAP[selected_display_tab]
         try:
@@ -935,7 +971,7 @@ with tab_find:
                         else:
                             st.success(f"BoxNumber: {box}")
         except Exception:
-            st.error("Box Location failed. If this persists, wait 30–60 seconds and retry.")
+            st.error("Box Location failed.")
 
         st.markdown("</div>", unsafe_allow_html=True)
 
@@ -954,7 +990,7 @@ with tab_find:
                         key_cols=["StudyID", "Visit", "SampleID", "Memo"],
                         height_mobile=360,
                         height_desktop=520,
-                        key_prefix="find_boxloc",
+                        key_prefix="find_boxloc_ln",
                     )
 
                     st.markdown("**StudyID → BoxNumber**")
@@ -963,7 +999,7 @@ with tab_find:
                     else:
                         studyids = df["StudyID"].dropna().astype(str).map(safe_strip)
                         options = sorted([s for s in studyids.unique().tolist() if s])
-                        selected_studyid = st.selectbox("StudyID", ["(select)"] + options, key="find_studyid")
+                        selected_studyid = st.selectbox("StudyID", ["(select)"] + options, key="find_studyid_ln")
                         if selected_studyid != "(select)":
                             box_map = build_box_map()
                             box = box_map.get(safe_strip(selected_studyid).upper(), "")
@@ -972,7 +1008,7 @@ with tab_find:
                             else:
                                 st.success(f"BoxNumber: {box}")
             except Exception:
-                st.error("Box Location failed. If this persists, wait 30–60 seconds and retry.")
+                st.error("Box Location failed.")
 
         with st.expander(f"🧊 LN Inventory Table ({selected_tank})", expanded=True):
             try:
@@ -1006,7 +1042,7 @@ with tab_find:
                                 key_prefix="find_ln_table",
                             )
             except Exception:
-                st.error("Failed to load LN inventory. If this persists, wait 30–60 seconds and retry.")
+                st.error("Failed to load LN inventory.")
 
 # ============================================================
 # ADD
@@ -1033,16 +1069,36 @@ with tab_add:
 
         with st.form("add_ln_form", clear_on_submit=True):
             rack = st.selectbox("RackNumber", [1, 2, 3, 4, 5, 6], index=0, key="add_ln_rack")
-            hiv_status = st.selectbox("HIV Status", ["HIV+", "HIV-"], index=0, key="add_ln_hiv")
-            drug_group = st.selectbox("Drug Group", ["Cocaine", "Cannabis", "Poly", "NON-DRUG"], index=0, key="add_ln_drug")
 
-            hp_hn = HIV_CODE[hiv_status]
-            drug_code = DRUG_CODE.get(drug_group)
-            if not drug_code:
-                st.error(f"Unknown Drug Group: {drug_group}. Please update DRUG_CODE.")
-                st.stop()
+            # ---- Naming: AD vs legacy ----
+            if selected_display_tab == "AD":
+                box_label_group = st.selectbox("BoxLabel_group (AD)", AD_GROUPS, key="add_ln_ad_group")
 
-            box_label_group = f"{hp_hn}-{drug_code}"
+                tube_prefix = AD_PREFIX_MAP.get(box_label_group, "01")
+                st.text_input("Tube Prefix (auto)", value=tube_prefix, disabled=True, key="add_ln_ad_prefix_locked")
+
+                tube_suffix = st.text_input("Tube suffix (001-999)", placeholder="e.g., 001", key="add_ln_ad_suffix").strip()
+                if tube_suffix:
+                    validate_ad_suffix_or_stop(tube_suffix)
+
+                st.caption("Prefix 01 = ADP (AD+), Prefix 02 = ADN (AD-)")
+
+                hp_hn = AD_UID_MAP.get(box_label_group, "ADP")
+                drug_code = "AD"
+
+            else:
+                hiv_status = st.selectbox("HIV Status", ["HIV+", "HIV-"], index=0, key="add_ln_hiv")
+                drug_group = st.selectbox("Drug Group", ["Cocaine", "Cannabis", "Poly", "NON-DRUG"], index=0, key="add_ln_drug")
+
+                hp_hn = HIV_CODE[hiv_status]
+                drug_code = DRUG_CODE.get(drug_group)
+                if not drug_code:
+                    st.error(f"Unknown Drug Group: {drug_group}. Please update DRUG_CODE.")
+                    st.stop()
+
+                box_label_group = f"{hp_hn}-{drug_code}"
+                tube_prefix = st.selectbox("Tube Prefix", ["GICU", "HCCU"], index=0, key="add_ln_prefix")
+                tube_suffix = st.text_input("Tube suffix", placeholder="e.g., 02 036", key="add_ln_suffix").strip()
 
             # ✅ LN max from LN3
             current_max_boxid = get_current_max_boxid_from_ln3()
@@ -1060,13 +1116,12 @@ with tab_add:
             st.text_input("BoxID (locked)", value=str(int(boxid_val)), disabled=True, key="add_ln_boxid_locked")
             boxid_input = str(int(boxid_val))
 
-            tube_prefix = st.selectbox("Tube Prefix", ["GICU", "HCCU"], index=0, key="add_ln_prefix")
-            tube_suffix = st.text_input("Tube suffix", placeholder="e.g., 02 036", key="add_ln_suffix").strip()
             tube_amount = st.number_input("TubeAmount", min_value=1, step=1, value=1, key="add_ln_amt")
             memo = st.text_area("Memo (optional)", key="add_ln_memo")
 
             tube_number = normalize_spaces(f"{tube_prefix} {tube_suffix}" if tube_suffix else "")
 
+            # Preview BoxUID + QR
             preview_uid, preview_qr, preview_err = "", "", ""
             try:
                 preview_uid = compute_next_boxuid(ln_view_df, selected_tank_add, rack, hp_hn, drug_code)
@@ -1082,9 +1137,12 @@ with tab_add:
 
             submitted = st.form_submit_button("Save to LN3", type="primary")
             if submitted:
-                if not tube_suffix:
-                    st.error("Tube suffix is required.")
-                    st.stop()
+                if selected_display_tab == "AD":
+                    validate_ad_suffix_or_stop(tube_suffix)
+                else:
+                    if not tube_suffix:
+                        st.error("Tube suffix is required.")
+                        st.stop()
 
                 try:
                     box_uid = compute_next_boxuid(ln_view_df, selected_tank_add, rack, hp_hn, drug_code)
@@ -1154,9 +1212,23 @@ with tab_add:
             st.text_input("BoxID (locked)", value=str(int(boxid_val)), disabled=True, key="add_fr_boxid_locked")
             boxid = str(int(boxid_val))
 
-            box_label_group = st.text_input("BoxLabel_group", placeholder="e.g., HP-COC / HN-CAN", key="add_fr_group").strip()
-            prefix = st.text_input("Prefix", placeholder="e.g., AD / GICU / HCCU", key="add_fr_prefix").strip().upper()
-            tube_suffix = st.text_input("Tube suffix", placeholder="e.g., 99 999", key="add_fr_suffix").strip()
+            # ---- Naming: AD vs legacy ----
+            if selected_display_tab == "AD":
+                box_label_group = st.selectbox("BoxLabel_group (AD)", AD_GROUPS, key="add_fr_ad_group")
+
+                prefix = AD_PREFIX_MAP.get(box_label_group, "01")
+                st.text_input("Prefix (auto)", value=prefix, disabled=True, key="add_fr_ad_prefix_locked")
+
+                tube_suffix = st.text_input("Tube suffix (001-999)", placeholder="e.g., 001", key="add_fr_ad_suffix").strip()
+                if tube_suffix:
+                    validate_ad_suffix_or_stop(tube_suffix)
+
+                st.caption("Prefix 01 = ADP (AD+), Prefix 02 = ADN (AD-)")
+            else:
+                box_label_group = st.text_input("BoxLabel_group", placeholder="e.g., HP-COC / HN-CAN", key="add_fr_group").strip()
+                prefix = st.text_input("Prefix", placeholder="e.g., AD / GICU / HCCU", key="add_fr_prefix").strip().upper()
+                tube_suffix = st.text_input("Tube suffix", placeholder="e.g., 99 999", key="add_fr_suffix").strip()
+
             tube_amount = st.number_input("TubeAmount", min_value=1, step=1, value=1, key="add_fr_amt")
 
             date_collected = st.text_input("Date Collected", value=default_date, key="add_fr_date").strip()
@@ -1172,8 +1244,12 @@ with tab_add:
                     st.error("BoxLabel_group is required."); st.stop()
                 if not prefix:
                     st.error("Prefix is required."); st.stop()
-                if not tube_suffix:
-                    st.error("Tube suffix is required."); st.stop()
+
+                if selected_display_tab == "AD":
+                    validate_ad_suffix_or_stop(tube_suffix)
+                else:
+                    if not tube_suffix:
+                        st.error("Tube suffix is required."); st.stop()
 
                 try:
                     fr_all_df = read_tab_cached(FREEZER_TAB)
@@ -1231,7 +1307,12 @@ with tab_add:
                     append_row_by_header(service, FREEZER_TAB, data)
 
                     # After saving Freezer record -> insert NEW row into boxNumber
-                    study_id_value = normalize_spaces(f"{prefix} {tube_suffix}".strip())
+                    study_id_value = make_studyid_for_boxnumber(
+                        display_study=selected_display_tab,
+                        prefix=prefix,
+                        tube_suffix=tube_suffix,
+                        box_label_group=box_label_group,
+                    )
                     try:
                         insert_boxnumber_row(service, study_id_value, boxid)
                     except Exception:
@@ -1253,6 +1334,7 @@ with tab_use:
     ln_all_df = read_tab_cached(LN_TAB)
     fr_all_df = read_tab_cached(FREEZER_TAB)
 
+    # Clean LN zeros
     try:
         if not ln_all_df.empty:
             deleted_ln = cleanup_zero_amount_rows(service, LN_TAB, ln_all_df, AMT_COL)
@@ -1262,6 +1344,7 @@ with tab_use:
     except Exception:
         pass
 
+    # Clean Freezer zeros and delete matching boxNumber rows (including AD-safe StudyID)
     try:
         if not fr_all_df.empty and (AMT_COL in fr_all_df.columns):
             fr_amt = pd.to_numeric(fr_all_df[AMT_COL], errors="coerce").fillna(0).astype(int)
@@ -1286,6 +1369,7 @@ with tab_use:
     except Exception:
         pass
 
+    # -------------------- USE: LN --------------------
     if STORAGE_TYPE == "LN Tank":
         if ln_all_df.empty:
             st.info("LN3 is empty.")
@@ -1429,6 +1513,7 @@ with tab_use:
                             read_tab_cached.clear()
                             st.rerun()
 
+    # -------------------- USE: Freezer --------------------
     else:
         if fr_all_df.empty:
             st.info("Freezer_Inventory is empty.")
@@ -1610,7 +1695,7 @@ with tab_history:
             )
 
     except Exception:
-        st.error("Unable to read Use_log. If this persists, wait 30–60 seconds and retry.")
+        st.error("Unable to read Use_log.")
 
 # ============================================================
 # SESSION REPORT
