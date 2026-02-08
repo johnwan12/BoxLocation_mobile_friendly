@@ -18,7 +18,11 @@
 #    - INSERT a NEW row into boxNumber tab:
 #      * StudyID   = "Prefix + Tube suffix" (from Freezer_Inventory)
 #      * BoxNumber = TubeAmount (from Freezer_Inventory)
-# ✅ Download CSV file_name includes TubeNumber, Time_stamp, ShippingTo
+# ✅ When Freezer TubeAmount becomes 0:
+#    - Delete the Freezer_Inventory row
+#    - Delete matching boxNumber row(s) where StudyID == "Prefix + Tube suffix"
+#    - Works in both "Use" flow and auto-clean cleanup
+# ✅ Download CSV file_name includes TubeNumber, Time_stamp, and ShippingTo
 # ✅ Mitigate Google Sheets 429 read quota using caching on reads (TTL)
 # ============================================================
 
@@ -28,7 +32,7 @@ import random
 import urllib.parse
 import urllib.request
 from datetime import datetime
-from typing import Tuple
+from typing import Tuple, List
 
 import pandas as pd
 import pytz
@@ -267,7 +271,6 @@ def read_tab_with_backoff(tab_name: str, tries: int = 5) -> pd.DataFrame:
 
 @st.cache_data(ttl=30, show_spinner=False)
 def read_tab_cached(tab_name: str) -> pd.DataFrame:
-    # Cache reads to reduce 429 quota errors
     return read_tab_with_backoff(tab_name)
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -328,13 +331,17 @@ def append_row_by_header(service, tab: str, data: dict):
         body={"values": [aligned]},
     ).execute()
 
-def cleanup_zero_amount_rows(service, tab_name: str, df: pd.DataFrame, amount_col: str = AMT_COL) -> bool:
+def cleanup_zero_amount_rows(service, tab_name: str, df: pd.DataFrame, amount_col: str = AMT_COL) -> List[int]:
+    """
+    Deletes all rows where amount_col == 0.
+    Returns the list of deleted dataframe row indexes (0-based) that were deleted.
+    """
     if df is None or df.empty or amount_col not in df.columns:
-        return False
+        return []
     amounts = pd.to_numeric(df[amount_col], errors="coerce").fillna(0).astype(int)
     zero_idxs = [int(i) for i in df.index[amounts == 0].tolist()]
     if not zero_idxs:
-        return False
+        return []
 
     sheet_id = get_sheet_id(service, tab_name)
     zero_idxs.sort(reverse=True)
@@ -354,7 +361,7 @@ def cleanup_zero_amount_rows(service, tab_name: str, df: pd.DataFrame, amount_co
             spreadsheetId=SPREADSHEET_ID,
             body={"requests": requests[i:i + 400]},
         ).execute()
-    return True
+    return zero_idxs
 
 def update_amount_by_index(service, tab_name: str, idx0: int, amount_col: str, new_amount: int):
     header = get_header(service, tab_name)
@@ -437,6 +444,61 @@ def ensure_boxnumber_header(service):
 def insert_boxnumber_row(service, study_id_value: str, box_number_value: str):
     ensure_boxnumber_header(service)
     append_row_by_header(service, BOX_TAB, {"StudyID": safe_strip(study_id_value), "BoxNumber": safe_strip(box_number_value)})
+
+def delete_boxnumber_rows_by_studyid(service, study_id_value: str) -> int:
+    """
+    Delete ALL rows in boxNumber where StudyID == study_id_value (exact match).
+    Returns number of rows deleted.
+    """
+    ensure_boxnumber_header(service)
+
+    df = read_tab_cached(BOX_TAB)
+    if df is None or df.empty or "StudyID" not in df.columns:
+        return 0
+
+    target = normalize_spaces(study_id_value)
+    df2 = df.copy()
+    df2["StudyID"] = df2["StudyID"].astype(str).map(normalize_spaces)
+
+    hit_idxs = [int(i) for i in df2.index[df2["StudyID"] == target].tolist()]
+    if not hit_idxs:
+        return 0
+
+    sheet_id = get_sheet_id(service, BOX_TAB)
+
+    # Delete bottom-to-top to prevent index shifting
+    hit_idxs.sort(reverse=True)
+    requests = []
+    for idx0 in hit_idxs:
+        requests.append({
+            "deleteDimension": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "dimension": "ROWS",
+                    "startIndex": idx0 + 1,   # +1 because header is row 1
+                    "endIndex": idx0 + 2,
+                }
+            }
+        })
+
+    for i in range(0, len(requests), 400):
+        service.spreadsheets().batchUpdate(
+            spreadsheetId=SPREADSHEET_ID,
+            body={"requests": requests[i:i + 400]},
+        ).execute()
+
+    return len(hit_idxs)
+
+def freezer_studyid_from_row(df: pd.DataFrame, idx0: int) -> str:
+    """
+    StudyID = 'Prefix + Tube suffix' for a freezer row index.
+    """
+    try:
+        p = safe_strip(df.loc[idx0, PREFIX_COL]).upper()
+        s = safe_strip(df.loc[idx0, SUFFIX_COL])
+        return normalize_spaces(f"{p} {s}".strip())
+    except Exception:
+        return ""
 
 def build_use_log_row(storage_type, tank_id, rack_number, freezer_id, box_label_group, boxid,
                       prefix, suffix, use_amt, user_initials, shipping_to, memo_in) -> dict:
@@ -784,7 +846,8 @@ with tab_find:
                     st.info("LN3 is empty.")
                 else:
                     try:
-                        if cleanup_zero_amount_rows(service, LN_TAB, ln_all_df, AMT_COL):
+                        deleted_idxs = cleanup_zero_amount_rows(service, LN_TAB, ln_all_df, AMT_COL)
+                        if deleted_idxs:
                             read_tab_cached.clear()
                             ln_all_df = read_tab_cached(LN_TAB)
                     except Exception:
@@ -1102,22 +1165,41 @@ with tab_use:
     st.subheader("Use / Log Usage")
     st.caption("Select an item → enter Use + User + ShippingTo → submits to Use_log and subtracts TubeAmount.")
 
-    # Reads are cached to reduce 429
     ln_all_df = read_tab_cached(LN_TAB)
     fr_all_df = read_tab_cached(FREEZER_TAB)
 
-    # Auto-clean (optional; clears cache if changes)
+    # Auto-clean (optional)
     try:
-        if not ln_all_df.empty and cleanup_zero_amount_rows(service, LN_TAB, ln_all_df, AMT_COL):
-            read_tab_cached.clear()
-            ln_all_df = read_tab_cached(LN_TAB)
+        if not ln_all_df.empty:
+            deleted_ln = cleanup_zero_amount_rows(service, LN_TAB, ln_all_df, AMT_COL)
+            if deleted_ln:
+                read_tab_cached.clear()
+                ln_all_df = read_tab_cached(LN_TAB)
     except Exception:
         pass
 
+    # Freezer auto-clean + boxNumber cleanup
     try:
-        if not fr_all_df.empty and cleanup_zero_amount_rows(service, FREEZER_TAB, fr_all_df, AMT_COL):
-            read_tab_cached.clear()
-            fr_all_df = read_tab_cached(FREEZER_TAB)
+        if not fr_all_df.empty and (AMT_COL in fr_all_df.columns):
+            fr_amt = pd.to_numeric(fr_all_df[AMT_COL], errors="coerce").fillna(0).astype(int)
+            zero_idxs = [int(i) for i in fr_all_df.index[fr_amt == 0].tolist()]
+
+            study_ids_to_delete = []
+            for idx0 in zero_idxs:
+                sid = freezer_studyid_from_row(fr_all_df, idx0)
+                if sid:
+                    study_ids_to_delete.append(sid)
+
+            deleted_fr = cleanup_zero_amount_rows(service, FREEZER_TAB, fr_all_df, AMT_COL)
+            if deleted_fr:
+                for sid in study_ids_to_delete:
+                    try:
+                        delete_boxnumber_rows_by_studyid(service, sid)
+                    except Exception:
+                        pass
+
+                read_tab_cached.clear()
+                fr_all_df = read_tab_cached(FREEZER_TAB)
     except Exception:
         pass
 
@@ -1364,6 +1446,7 @@ with tab_use:
                                 st.error(f"Not enough stock. Current={cur_amount}, Use={int(use_amt)}")
                                 st.stop()
 
+                            # Log to Use_log
                             append_row_by_header(
                                 service,
                                 USE_LOG_TAB,
@@ -1384,12 +1467,25 @@ with tab_use:
                             )
 
                             if new_amount == 0:
+                                # Build StudyID from the row being deleted
+                                study_id_value = freezer_studyid_from_row(fr_all_df, idx0)
+
+                                # Delete freezer row
                                 delete_row_by_index(service, FREEZER_TAB, idx0)
+
+                                # Delete matching boxNumber row(s)
+                                if study_id_value:
+                                    try:
+                                        delete_boxnumber_rows_by_studyid(service, study_id_value)
+                                    except Exception:
+                                        pass
+
                                 st.success("Logged ✅ Saved to Use_log. TubeAmount reached 0 → row deleted.")
                             else:
                                 update_amount_by_index(service, FREEZER_TAB, idx0, AMT_COL, new_amount)
                                 st.success(f"Logged ✅ Remaining TubeAmount: {new_amount}")
 
+                            # Session report row
                             ts = now_timestamp_str()
                             st.session_state.usage_final_rows.append(
                                 build_final_report_row(
@@ -1441,10 +1537,9 @@ with tab_history:
 
             show_df_view(tail_df, key_cols=key_cols, height_mobile=360, height_desktop=520, key_prefix="hist_uselog")
 
-            # Download whole tail_df, filename based on LAST row (most recent shown)
+            # Download displayed tail_df, filename based on LAST row shown
             csv_bytes = tail_df.to_csv(index=False).encode("utf-8")
-            last_row_df = tail_df.tail(1)
-            fname = build_report_filename(last_row_df, prefix="UseLog", ext="csv")
+            fname = build_report_filename(tail_df.tail(1), prefix="UseLog", ext="csv")
 
             st.download_button(
                 "⬇️ Download displayed Use_log (CSV)",
@@ -1477,8 +1572,7 @@ with tab_session:
 
         csv_bytes = final_df.to_csv(index=False).encode("utf-8")
 
-        # Filename uses TubeNumber + Time_stamp + ShippingTo:
-        # Session report does not have TubeNumber, so we build a TubeNumber field for naming.
+        # Session report doesn't store TubeNumber column; build it for filename only
         name_df = final_df.copy()
         if "TubeNumber" not in name_df.columns and ("Prefix" in name_df.columns) and ("Tube suffix" in name_df.columns):
             name_df["TubeNumber"] = name_df.apply(
