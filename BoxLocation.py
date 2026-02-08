@@ -17,7 +17,7 @@
 # ✅ fetch_bytes() disables proxies to reduce SSL WRONG_VERSION_NUMBER issues
 # ✅ After saving Freezer record:
 #    - INSERT a NEW row into boxNumber tab:
-#      * StudyID   = "Prefix + Tube suffix" (or for AD: "AD Prefix TubeSuffix" to avoid collisions)
+#      * StudyID   = "Prefix + Tube suffix" (or for AD: "AD {Prefix} {Tube suffix}" to avoid collisions)
 #      * BoxNumber = BoxID used in Freezer_Inventory ✅
 # ✅ When Freezer TubeAmount becomes 0:
 #    - Delete the Freezer_Inventory row
@@ -35,7 +35,8 @@
 #    - Freezer boxNumber StudyID is collision-safe: "AD {Prefix} {Tube suffix}"
 #    - Other than naming differences, processes are the same.
 #
-# ✅ NEW: Freezer_Inventory includes StudyCode column (written on add; displayed in Find/Use)
+# ✅ NEW: Freezer_Inventory includes StudyCode column
+# ✅ NEW: LN3 includes StudyCode column
 # ============================================================
 
 import re
@@ -171,7 +172,7 @@ BOXID_COL = "BoxID"
 AMT_COL = "TubeAmount"
 MEMO_COL = "Memo"
 
-# ✅ NEW column in Freezer_Inventory
+# ✅ NEW shared column (LN3 + Freezer_Inventory)
 STUDYCODE_COL = "StudyCode"
 
 # LN columns
@@ -495,7 +496,9 @@ def compute_next_boxuid(ln_view_df: pd.DataFrame, tank_id: str, rack: int, hp_hn
     return f"{prefix}{nxt:02d}"
 
 def ensure_ln_header(service):
+    # ✅ NEW: StudyCode included
     set_header_if_blank(service, LN_TAB, [
+        "StudyCode",
         "TankID", "RackNumber", "BoxLabel_group", "BoxUID",
         "TubeNumber", "TubeAmount", "Memo", "BoxID", "QRCodeLink",
     ])
@@ -795,8 +798,8 @@ if missing_tabs or missing_study:
 try:
     _ = get_sheet_id_map(SPREADSHEET_ID)
     ensure_use_log_header(service)
-    ensure_ln_header(service)
-    ensure_freezer_header(service)  # ✅ includes StudyCode if header row is blank
+    ensure_ln_header(service)       # ✅ LN3 StudyCode if header row blank
+    ensure_freezer_header(service)  # ✅ Freezer StudyCode if header row blank
     ensure_boxnumber_header(service)
 except Exception:
     st.error("❌ Sheet preflight failed (headers/tabs).")
@@ -920,7 +923,7 @@ with tab_find:
         except Exception:
             st.error("Freezer search failed.")
 
-    # --- FREEZER MODE: Focus Freezer Search FIRST (Tom/Jerry), Box Location ALWAYS visible ---
+    # --- FREEZER MODE ---
     if STORAGE_TYPE == "Freezer":
         st.markdown("<div id='freezer_search_anchor'></div>", unsafe_allow_html=True)
 
@@ -981,7 +984,7 @@ with tab_find:
 
         st.markdown("</div>", unsafe_allow_html=True)
 
-    # --- LN MODE: Box Location collapsed by default, then LN table ---
+    # --- LN MODE ---
     else:
         boxloc_title = "📦 Box Location"
         with st.expander(boxloc_title, expanded=False):
@@ -1042,7 +1045,7 @@ with tab_find:
                         else:
                             show_df_view(
                                 ln_view_df,
-                                key_cols=[TANK_COL, RACK_COL, BOX_LABEL_COL, BOXID_COL, TUBE_COL, AMT_COL, MEMO_COL],
+                                key_cols=[STUDYCODE_COL, TANK_COL, RACK_COL, BOX_LABEL_COL, BOXID_COL, TUBE_COL, AMT_COL, MEMO_COL],
                                 height_mobile=360,
                                 height_desktop=520,
                                 key_prefix="find_ln_table",
@@ -1074,6 +1077,11 @@ with tab_add:
             ln_view_df = ln_view_df[ln_view_df[TANK_COL] == safe_strip(selected_tank_add).upper()].copy()
 
         with st.form("add_ln_form", clear_on_submit=True):
+            # ✅ NEW: StudyCode locked from context
+            study_code_default = safe_strip(selected_display_tab)
+            st.text_input("StudyCode (from context)", value=study_code_default, disabled=True, key="add_ln_studycode_locked")
+            study_code = study_code_default
+
             rack = st.selectbox("RackNumber", [1, 2, 3, 4, 5, 6], index=0, key="add_ln_rack")
 
             # ---- Naming: AD vs legacy ----
@@ -1154,6 +1162,7 @@ with tab_add:
                     qr_link = qr_link_for_boxuid(box_uid)
 
                     data = {
+                        STUDYCODE_COL: study_code,  # ✅ NEW
                         TANK_COL: safe_strip(selected_tank_add).upper(),
                         RACK_COL: int(rack),
                         BOX_LABEL_COL: box_label_group,
@@ -1204,7 +1213,7 @@ with tab_add:
         freezer_id_default = safe_strip(selected_freezer).upper()
 
         with st.form("add_fr_form", clear_on_submit=True):
-            # ✅ NEW StudyCode (from context)
+            # ✅ StudyCode locked from context
             study_code_default = safe_strip(selected_display_tab)
             st.text_input("StudyCode (from context)", value=study_code_default, disabled=True, key="add_fr_studycode_locked")
             study_code = study_code_default
@@ -1276,7 +1285,7 @@ with tab_add:
                 key_prefix = _norm(prefix).upper()
                 key_suffix = _norm(tube_suffix)
 
-                # ✅ Duplicate check includes StudyCode (recommended)
+                # Duplicate check includes StudyCode (recommended)
                 if not fr_all_df.empty:
                     needed = {STUDYCODE_COL, FREEZER_COL, BOX_LABEL_COL, BOXID_COL, PREFIX_COL, SUFFIX_COL}
                     if needed.issubset(set(fr_all_df.columns)):
@@ -1303,7 +1312,7 @@ with tab_add:
                             st.stop()
 
                 data = {
-                    STUDYCODE_COL: study_code,   # ✅ NEW
+                    STUDYCODE_COL: study_code,
                     FREEZER_COL: freezer_id,
                     BOXID_COL: boxid,
                     PREFIX_COL: prefix,
@@ -1448,7 +1457,7 @@ with tab_use:
                             f"Box {r.get(BOX_LABEL_COL,'')} | BoxID {r.get(BOXID_COL,'')} | "
                             f"TubeAmount {r.get(AMT_COL,'')}"
                         )
-                        show_cols = [TANK_COL, RACK_COL, BOX_LABEL_COL, BOXID_COL, TUBE_COL, AMT_COL, MEMO_COL]
+                        show_cols = [STUDYCODE_COL, TANK_COL, RACK_COL, BOX_LABEL_COL, BOXID_COL, TUBE_COL, AMT_COL, MEMO_COL]
                         show_cols = [c for c in show_cols if c in match_df.columns]
                         st.dataframe(match_df[show_cols], use_container_width=True, hide_index=True, height=200)
 
