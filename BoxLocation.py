@@ -1,25 +1,24 @@
 # BoxLocation.py — Professional UI + Simple Workflow + Sticky Header + Tabs
 # ============================================================
-# Implemented (as requested):
+# Implemented:
 # ✅ Storage = LN Tank uses tab LN3 ONLY
 # ✅ Subset LN3 by TankID == LN1/LN2/LN3 and show LN Inventory Table
-# ✅ In FIND tab:
-#    - If Storage=LN Tank: show LN Inventory Table (selected tank)
-#    - If Storage=Freezer: show Freezer Search by BoxLabel_group (selected freezer)
-# ✅ Professional workflow tabs: Find / Add / Use / History / Session Report
+# ✅ FIND tab:
+#    - Storage=LN Tank: show LN Inventory Table (selected tank)
+#    - Storage=Freezer: show Freezer Search by BoxLabel_group (selected freezer)
+# ✅ Workflow tabs: Find / Add / Use / History / Session Report
 # ✅ Compact Context Bar always visible + Debug/Preflight hidden by default
-# ✅ Sticky header (best-effort)
+# ✅ Sticky header (best-effort CSS)
 # ✅ ADD tab behavior:
-#    1) Storage=LN Tank -> show only "Add to LN" (hide Add Freezer)
-#    2) Storage=Freezer -> show only "Add to Freezer" (hide Add LN)
-#    3) Add Freezer: FreezerID follows Context Freezer (Tom/Jerry/Sammy) and is locked
+#    - Storage=LN Tank -> only Add to LN
+#    - Storage=Freezer -> only Add to Freezer
+#    - FreezerID follows Context Freezer (Sammy/Tom/Jerry) and is locked
 # ✅ After saving Freezer record:
-#    - Upsert/append into boxNumber tab (BoxNumber/BoxID columns):
-#      * append "Prefix TubeSuffix" into boxNumber!BoxID for that BoxNumber
-#      * append BoxID into boxNumber!BoxNumber (as a text list; see note inside helper)
+#    - INSERT a NEW row into boxNumber tab:
+#      * BoxNumber = BoxID used in Freezer_Inventory
+#      * BoxID     = "Prefix + Tube suffix"
 # ============================================================
 
-import logging
 import re
 import urllib.parse
 import urllib.request
@@ -404,6 +403,19 @@ def ensure_use_log_header(service):
         "Use", "User", "Time_stamp", "ShippingTo", "Memo",
     ])
 
+def ensure_boxnumber_header(service):
+    # Only sets if header row is blank
+    set_header_if_blank(service, BOX_TAB, ["BoxNumber", "BoxID"])
+
+def insert_boxnumber_row(service, box_number: str, tube_id: str):
+    """
+    INSERT (append) a NEW row into boxNumber with:
+      - BoxNumber = box_number
+      - BoxID     = tube_id ("Prefix Tube suffix")
+    """
+    ensure_boxnumber_header(service)
+    append_row_by_header(service, BOX_TAB, {"BoxNumber": safe_strip(box_number), "BoxID": safe_strip(tube_id)})
+
 def build_use_log_row(storage_type, tank_id, rack_number, freezer_id, box_label_group, boxid,
                       prefix, suffix, use_amt, user_initials, shipping_to, memo_in) -> dict:
     tube_number_combined = normalize_spaces(f"{safe_strip(prefix).upper()} {safe_strip(suffix)}".strip())
@@ -557,7 +569,6 @@ def read_column_values(tab: str, col_name: str) -> pd.Series:
     return pd.to_numeric(pd.Series(vals), errors="coerce")
 
 def get_current_max_boxnumber_global() -> int:
-    # NOTE: includes LN3 BoxID too (safer global max)
     series_list = []
     try:
         series_list.append(read_column_values(BOX_TAB, "BoxNumber"))
@@ -580,80 +591,6 @@ def get_current_max_boxnumber_global() -> int:
         if not s2.empty:
             mx = max(mx, int(s2.max()))
     return max(mx, 0)
-
-# -------------------- boxNumber append helpers (your request) --------------------
-def ensure_boxnumber_header(service):
-    # Sets only if row1 blank (won't overwrite existing non-blank header)
-    set_header_if_blank(service, BOX_TAB, ["BoxNumber", "BoxID"])
-
-def _append_text(old: str, new: str, sep: str = "; ") -> str:
-    old = safe_strip(old)
-    new = safe_strip(new)
-    if not new:
-        return old
-    if not old:
-        return new
-    parts = [p.strip() for p in old.split(sep.strip()) if p.strip()]
-    if new in parts:
-        return old
-    return f"{old}{sep}{new}"
-
-def upsert_boxnumber_append(service, boxid: str, tube_id: str):
-    """
-    Writes into boxNumber tab:
-      - append tube_id (Prefix + Tube suffix) into column 'BoxID'
-      - append boxid into column 'BoxNumber' (as a text list)
-
-    IMPORTANT:
-      If you want BoxNumber to remain numeric (recommended), tell me and I’ll change this to append into a different column.
-    """
-    ensure_boxnumber_header(service)
-
-    df = read_tab(BOX_TAB)
-    if df is None or df.empty:
-        append_row_by_header(service, BOX_TAB, {"BoxNumber": safe_strip(boxid), "BoxID": safe_strip(tube_id)})
-        return
-
-    if "BoxNumber" not in df.columns:
-        raise ValueError("boxNumber tab missing column 'BoxNumber'")
-    if "BoxID" not in df.columns:
-        raise ValueError("boxNumber tab missing column 'BoxID'")
-
-    df_bn = df.copy()
-    df_bn["BoxNumber"] = df_bn["BoxNumber"].astype(str).map(safe_strip)
-
-    match = df_bn.index[df_bn["BoxNumber"] == safe_strip(boxid)].tolist()
-    if not match:
-        append_row_by_header(service, BOX_TAB, {"BoxNumber": safe_strip(boxid), "BoxID": safe_strip(tube_id)})
-        return
-
-    idx0 = int(match[0])
-    header = get_header(service, BOX_TAB)
-    sheet_row = idx0 + 2
-
-    # Update BoxID (append tube_id)
-    col_boxid = header.index("BoxID")
-    a1_boxid = col_to_a1(col_boxid)
-    old_boxid_val = safe_strip(df.loc[idx0, "BoxID"])
-    new_boxid_val = _append_text(old_boxid_val, tube_id, sep="; ")
-    service.spreadsheets().values().update(
-        spreadsheetId=SPREADSHEET_ID,
-        range=f"{BOX_TAB}!{a1_boxid}{sheet_row}",
-        valueInputOption="RAW",
-        body={"values": [[new_boxid_val]]},
-    ).execute()
-
-    # Update BoxNumber (append boxid)
-    col_bn = header.index("BoxNumber")
-    a1_bn = col_to_a1(col_bn)
-    old_bn_val = safe_strip(df.loc[idx0, "BoxNumber"])
-    new_bn_val = _append_text(old_bn_val, safe_strip(boxid), sep="; ")
-    service.spreadsheets().values().update(
-        spreadsheetId=SPREADSHEET_ID,
-        range=f"{BOX_TAB}!{a1_bn}{sheet_row}",
-        valueInputOption="RAW",
-        body={"values": [[new_bn_val]]},
-    ).execute()
 
 # ============================================================
 # Preflight (hidden unless debug or failure)
@@ -690,7 +627,8 @@ if connected_ok and not missing_tabs and not missing_study:
 # ============================================================
 # Sticky Header: title + status + context + mode tabs
 # ============================================================
-st.markdown("### 📦 Sample Inventory")
+# If your "first title is not showing", this forces a visible title even if CSS sticky misbehaves.
+st.title("📦 Sample Inventory")
 
 c_status, c_toggles = st.columns([1, 1])
 with c_status:
@@ -755,7 +693,6 @@ tab_find, tab_add, tab_use, tab_history, tab_session = st.tabs(
 with tab_find:
     st.subheader("Find / Locate")
 
-    # Optional: keep Box Location always visible
     with st.expander("📦 Box Location", expanded=True):
         tab_name = TAB_MAP[selected_display_tab]
         try:
@@ -789,15 +726,13 @@ with tab_find:
             st.error("Box Location failed.")
             st.code(err_detail(e), language="text")
 
-    # Storage-dependent panel
     if STORAGE_TYPE == "LN Tank":
         with st.expander(f"🧊 LN Inventory Table ({selected_tank})", expanded=True):
             try:
-                ln_all_df = read_tab(LN_TAB)  # always LN3
+                ln_all_df = read_tab(LN_TAB)
                 if ln_all_df.empty:
                     st.info("LN3 is empty.")
                 else:
-                    # Clean 0 rows (optional)
                     try:
                         if cleanup_zero_amount_rows(service, LN_TAB, ln_all_df, AMT_COL):
                             ln_all_df = read_tab(LN_TAB)
@@ -810,7 +745,6 @@ with tab_find:
                         ln_view_df = ln_all_df.copy()
                         ln_view_df[TANK_COL] = ln_view_df[TANK_COL].astype(str).map(lambda x: safe_strip(x).upper())
                         ln_view_df = ln_view_df[ln_view_df[TANK_COL] == safe_strip(selected_tank).upper()].copy()
-
                         if ln_view_df.empty:
                             st.info(f"No records for {selected_tank}.")
                         else:
@@ -824,7 +758,6 @@ with tab_find:
             except Exception as e:
                 st.error("Failed to load LN inventory.")
                 st.code(err_detail(e), language="text")
-
     else:
         with st.expander("🧊 Freezer Search by BoxLabel_group", expanded=True):
             try:
@@ -837,15 +770,12 @@ with tab_find:
                     df_search = fr_all_df.copy()
                     if FREEZER_COL in df_search.columns:
                         df_search[FREEZER_COL] = df_search[FREEZER_COL].astype(str).map(lambda x: safe_strip(x).upper())
-
-                    # Restrict to selected freezer from Context Bar
                     df_search = df_search[df_search[FREEZER_COL] == safe_strip(selected_freezer).upper()].copy()
 
                     df_search[BOX_LABEL_COL] = df_search[BOX_LABEL_COL].astype(str).map(safe_strip)
                     groups = sorted([g for g in df_search[BOX_LABEL_COL].dropna().unique().tolist() if safe_strip(g)])
 
                     mode = st.radio("Mode", ["Exact", "Contains"], horizontal=not st.session_state.mobile_mode, key="find_fr_mode")
-
                     if mode == "Exact":
                         chosen_group = st.selectbox("BoxLabel_group", ["(select)"] + groups, key="find_fr_group_exact")
                         if chosen_group != "(select)":
@@ -882,13 +812,10 @@ with tab_find:
 with tab_add:
     st.subheader("Add Inventory")
 
-    # ✅ Storage-dependent visibility (your request)
     if STORAGE_TYPE == "LN Tank":
         st.subheader("🧊 Add to LN")
         st.caption("LN Tank mode → Add to LN only (Add to Freezer hidden).")
 
-        # --- Add LN ---
-        st.caption("Adds a new LN record into LN3 (QR auto-generated).")
         selected_tank_add = st.selectbox("Tank", ["LN1", "LN2", "LN3"], index=2, key="add_ln_tank")
 
         try:
@@ -953,7 +880,6 @@ with tab_add:
                 if not tube_suffix:
                     st.error("Tube suffix is required.")
                     st.stop()
-
                 try:
                     box_uid = compute_next_boxuid(ln_view_df, selected_tank_add, rack, hp_hn, drug_code)
                     qr_link = qr_link_for_boxuid(box_uid)
@@ -999,10 +925,7 @@ with tab_add:
         st.subheader("🧊 Add to Freezer")
         st.caption("Freezer mode → Add to Freezer only (Add to LN hidden).")
 
-        # --- Add Freezer ---
-        st.caption("Adds a new record into Freezer_Inventory.")
         default_date = today_str_ny()
-
         current_max_boxnumber = get_current_max_boxnumber_global()
         st.caption(f"Global current max BoxNumber/BoxID: {current_max_boxnumber if current_max_boxnumber else '(none)'}")
 
@@ -1010,10 +933,9 @@ with tab_add:
             st.error("Please select a Freezer in the top Context Bar.")
             st.stop()
 
-        freezer_id_default = safe_strip(selected_freezer).upper()  # TOM/JERRY/SAMMY
+        freezer_id_default = safe_strip(selected_freezer).upper()
 
         with st.form("add_fr_form", clear_on_submit=True):
-            # ✅ FreezerID follows context and is locked
             st.text_input("FreezerID (from context)", value=freezer_id_default, disabled=True, key="add_fr_freezer_locked")
             freezer_id = freezer_id_default
 
@@ -1055,7 +977,6 @@ with tab_add:
                 except Exception:
                     fr_all_df = pd.DataFrame()
 
-                # Duplicate check
                 def _norm(s: str) -> str:
                     return normalize_spaces(s)
 
@@ -1109,12 +1030,12 @@ with tab_add:
                 try:
                     append_row_by_header(service, FREEZER_TAB, data)
 
-                    # ✅ Update boxNumber tab (your earlier request)
+                    # ✅ After saving Freezer record: INSERT a new row into boxNumber
                     tube_id = normalize_spaces(f"{prefix} {tube_suffix}".strip())
                     try:
-                        upsert_boxnumber_append(service, boxid=boxid, tube_id=tube_id)
+                        insert_boxnumber_row(service, box_number=boxid, tube_id=tube_id)
                     except Exception as e2:
-                        st.warning(f"Saved freezer record, but boxNumber update failed: {err_detail(e2)}")
+                        st.warning(f"Saved freezer record, but boxNumber insert failed: {err_detail(e2)}")
 
                     st.success("Saved ✅ Freezer_Inventory record")
                     st.rerun()
@@ -1139,7 +1060,6 @@ with tab_use:
     except Exception:
         fr_all_df = pd.DataFrame()
 
-    # Auto-clean (optional)
     try:
         if not ln_all_df.empty and cleanup_zero_amount_rows(service, LN_TAB, ln_all_df, AMT_COL):
             ln_all_df = read_tab(LN_TAB)
@@ -1172,7 +1092,6 @@ with tab_use:
                 dfv["_suffix"] = dfv[TUBE_COL].map(lambda x: split_tube_number(x)[1])
 
                 scoped = dfv[dfv[TANK_COL] == safe_strip(selected_tank).upper()].copy()
-
                 if scoped.empty:
                     st.info(f"No records for {selected_tank}.")
                 else:
@@ -1312,7 +1231,6 @@ with tab_use:
                 dfv[AMT_COL] = pd.to_numeric(dfv[AMT_COL], errors="coerce").fillna(0).astype(int)
 
                 scoped = dfv[dfv[FREEZER_COL] == safe_strip(selected_freezer).upper()].copy()
-
                 if scoped.empty:
                     st.info(f"No records for {selected_freezer}.")
                 else:
