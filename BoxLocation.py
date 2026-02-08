@@ -760,7 +760,7 @@ with tab_find:
     st.subheader("Find / Locate")
 
     # ✅ Your request: minimized when LN Tank is selected
-    boxloc_title = f"📦 {safe_strip(selected_freezer).upper()}: Box Location" if STORAGE_TYPE == "Freezer" else "📦 Sammy Box Location"
+    boxloc_title = f"📦 {safe_strip(selected_freezer).upper()}: Box Location" if STORAGE_TYPE == "Freezer" else "📦 Box Location"
     boxloc_expanded = True if STORAGE_TYPE == "Freezer" else False
 
     with st.expander(boxloc_title, expanded=boxloc_expanded):
