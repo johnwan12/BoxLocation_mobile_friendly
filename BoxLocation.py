@@ -6,27 +6,34 @@
 # ✅ FIND tab:
 #    - Storage=LN Tank: show LN Inventory Table (selected tank)
 #    - Storage=Freezer: show Freezer Search by BoxLabel_group (selected freezer)
-# ✅ Workflow tabs: Find / Add / Use / History / Session Report
+# ✅ Professional workflow tabs: Find / Add / Use / History / Session Report
 # ✅ Compact Context Bar always visible + Debug/Preflight hidden by default
 # ✅ Sticky header (best-effort CSS)
 # ✅ ADD tab behavior:
 #    - Storage=LN Tank -> only Add to LN (Add to Freezer hidden)
 #    - Storage=Freezer -> only Add to Freezer (Add to LN hidden)
 #    - FreezerID follows Context Freezer (Sammy/Tom/Jerry) and is locked
+# ✅ QR generation is LOCAL (no QuickChart HTTPS calls) -> fixes SSL WRONG_VERSION_NUMBER
 # ✅ After saving Freezer record:
 #    - INSERT a NEW row into boxNumber tab:
-#      * StudyID   = "Prefix + Tube suffix" (from Freezer_Inventory)
-#      * BoxNumber = BoxID used in Freezer_Inventory
+#      * StudyID   = "Prefix + Tube suffix" (from Freezer_Inventory)  e.g., "AD 99 999"
+#      * BoxNumber = TubeAmount (from Freezer_Inventory)              e.g., 12
+#
+# Requirements note:
+# - Add these to requirements.txt (Streamlit Cloud):
+#     qrcode[pil]
+#     pillow
 # ============================================================
 
+import io
 import re
 import urllib.parse
-import urllib.request
 from datetime import datetime
 from typing import Tuple
 
 import pandas as pd
 import pytz
+import qrcode
 import streamlit as st
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
@@ -92,10 +99,10 @@ div[data-testid="stDataFrame"] { padding: 0.25rem 0; }
 )
 
 # -------------------- Session State --------------------
-if "last_qr_link" not in st.session_state:
-    st.session_state.last_qr_link = ""
 if "last_qr_uid" not in st.session_state:
     st.session_state.last_qr_uid = ""
+if "last_qr_png" not in st.session_state:
+    st.session_state.last_qr_png = b""
 if "usage_final_rows" not in st.session_state:
     st.session_state.usage_final_rows = []
 if "mobile_mode" not in st.session_state:
@@ -119,7 +126,7 @@ USE_LOG_TAB = "Use_log"
 
 # Shared columns
 BOX_LABEL_COL = "BoxLabel_group"
-BOXID_COL = "BoxID"         # used in LN3 and Freezer_Inventory
+BOXID_COL = "BoxID"
 AMT_COL = "TubeAmount"
 MEMO_COL = "Memo"
 
@@ -197,14 +204,21 @@ def split_tube_number(t: str) -> Tuple[str, str]:
         return parts[0], ""
     return parts[0], parts[1]
 
-def qr_link_for_boxuid(box_uid: str, px: int = QR_PX) -> str:
-    text = urllib.parse.quote(box_uid, safe="")
-    return f"https://quickchart.io/qr?text={text}&size={px}&ecLevel=Q&margin=1"
+# ✅ LOCAL QR PNG bytes (no HTTPS calls)
+def qr_png_bytes_for_text(text: str, box_size: int = 6, border: int = 2) -> bytes:
+    qr = qrcode.QRCode(
+        version=None,
+        error_correction=qrcode.constants.ERROR_CORRECT_Q,
+        box_size=box_size,
+        border=border,
+    )
+    qr.add_data(text)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="black", back_color="white")
 
-def fetch_bytes(url: str, timeout: int = 10) -> bytes:
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return resp.read()
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
 
 def err_detail(e: Exception) -> str:
     try:
@@ -403,21 +417,23 @@ def ensure_use_log_header(service):
         "Use", "User", "Time_stamp", "ShippingTo", "Memo",
     ])
 
-# ✅ boxNumber sheet now uses: StudyID + BoxNumber
+# ✅ boxNumber sheet: StudyID + BoxNumber
 def ensure_boxnumber_header(service):
     set_header_if_blank(service, BOX_TAB, ["StudyID", "BoxNumber"])
 
-def insert_boxnumber_row(service, study_id_value: str, box_number: str):
+def insert_boxnumber_row(service, study_id_value: str, box_number_value: str):
     """
     INSERT (append) a NEW row into boxNumber with:
       - StudyID   = Prefix + Tube suffix
-      - BoxNumber = BoxID used in Freezer_Inventory (your "box number")
+      - BoxNumber = TubeAmount  (per your latest requirement)
+    Example:
+      StudyID="AD 99 999", BoxNumber="12"
     """
     ensure_boxnumber_header(service)
     append_row_by_header(
         service,
         BOX_TAB,
-        {"StudyID": safe_strip(study_id_value), "BoxNumber": safe_strip(box_number)},
+        {"StudyID": safe_strip(study_id_value), "BoxNumber": safe_strip(box_number_value)},
     )
 
 def build_use_log_row(storage_type, tank_id, rack_number, freezer_id, box_label_group, boxid,
@@ -573,24 +589,12 @@ def read_column_values(tab: str, col_name: str) -> pd.Series:
     return pd.to_numeric(pd.Series(vals), errors="coerce")
 
 def get_current_max_boxnumber_global() -> int:
-    series_list = []
-    # ✅ if you use boxNumber!BoxNumber as global counter
-    try:
-        series_list.append(read_column_values(BOX_TAB, "BoxNumber"))
-    except Exception:
-        pass
-    try:
-        series_list.append(read_column_values(FREEZER_TAB, BOXID_COL))
-    except Exception:
-        pass
-    try:
-        series_list.append(read_column_values(LN_TAB, BOXID_COL))
-    except Exception:
-        pass
-
+    # Use LN/Freezer BoxID to pick next BoxID for Freezer records
     mx = 0
-    for s in series_list:
-        if s is None:
+    for tab in [LN_TAB, FREEZER_TAB]:
+        try:
+            s = read_column_values(tab, BOXID_COL)
+        except Exception:
             continue
         s2 = pd.to_numeric(s, errors="coerce").dropna()
         if not s2.empty:
@@ -731,7 +735,7 @@ with tab_find:
     if STORAGE_TYPE == "LN Tank":
         with st.expander(f"🧊 LN Inventory Table ({selected_tank})", expanded=True):
             try:
-                ln_all_df = read_tab(LN_TAB)
+                ln_all_df = read_tab(LN_TAB)  # always LN3
                 if ln_all_df.empty:
                     st.info("LN3 is empty.")
                 else:
@@ -747,6 +751,7 @@ with tab_find:
                         ln_view_df = ln_all_df.copy()
                         ln_view_df[TANK_COL] = ln_view_df[TANK_COL].astype(str).map(lambda x: safe_strip(x).upper())
                         ln_view_df = ln_view_df[ln_view_df[TANK_COL] == safe_strip(selected_tank).upper()].copy()
+
                         if ln_view_df.empty:
                             st.info(f"No records for {selected_tank}.")
                         else:
@@ -760,6 +765,7 @@ with tab_find:
             except Exception as e:
                 st.error("Failed to load LN inventory.")
                 st.code(err_detail(e), language="text")
+
     else:
         with st.expander("🧊 Freezer Search by BoxLabel_group", expanded=True):
             try:
@@ -772,12 +778,14 @@ with tab_find:
                     df_search = fr_all_df.copy()
                     if FREEZER_COL in df_search.columns:
                         df_search[FREEZER_COL] = df_search[FREEZER_COL].astype(str).map(lambda x: safe_strip(x).upper())
+
                     df_search = df_search[df_search[FREEZER_COL] == safe_strip(selected_freezer).upper()].copy()
 
                     df_search[BOX_LABEL_COL] = df_search[BOX_LABEL_COL].astype(str).map(safe_strip)
                     groups = sorted([g for g in df_search[BOX_LABEL_COL].dropna().unique().tolist() if safe_strip(g)])
 
                     mode = st.radio("Mode", ["Exact", "Contains"], horizontal=not st.session_state.mobile_mode, key="find_fr_mode")
+
                     if mode == "Exact":
                         chosen_group = st.selectbox("BoxLabel_group", ["(select)"] + groups, key="find_fr_group_exact")
                         if chosen_group != "(select)":
@@ -814,6 +822,8 @@ with tab_find:
 with tab_add:
     st.subheader("Add Inventory")
 
+    # 1) Storage=LN Tank -> Add LN only
+    # 2) Storage=Freezer -> Add Freezer only
     if STORAGE_TYPE == "LN Tank":
         st.subheader("🧊 Add to LN")
         st.caption("LN Tank mode → Add to LN only (Add to Freezer hidden).")
@@ -864,10 +874,9 @@ with tab_add:
 
             tube_number = normalize_spaces(f"{tube_prefix} {tube_suffix}" if tube_suffix else "")
 
-            preview_uid, preview_qr, preview_err = "", "", ""
+            preview_uid, preview_err = "", ""
             try:
                 preview_uid = compute_next_boxuid(ln_view_df, selected_tank_add, rack, hp_hn, drug_code)
-                preview_qr = qr_link_for_boxuid(preview_uid)
             except Exception as e:
                 preview_err = str(e)
 
@@ -875,16 +884,17 @@ with tab_add:
                 st.error(preview_err)
             else:
                 st.info(f"BoxUID (auto): {preview_uid}")
-                st.image(preview_qr, width=QR_PX)
+                st.image(qr_png_bytes_for_text(preview_uid), width=QR_PX)
 
             submitted = st.form_submit_button("Save to LN3", type="primary")
             if submitted:
                 if not tube_suffix:
                     st.error("Tube suffix is required.")
                     st.stop()
+
                 try:
                     box_uid = compute_next_boxuid(ln_view_df, selected_tank_add, rack, hp_hn, drug_code)
-                    qr_link = qr_link_for_boxuid(box_uid)
+                    qr_link = ""  # kept for sheet compatibility; QR is generated locally now
 
                     data = {
                         TANK_COL: safe_strip(selected_tank_add).upper(),
@@ -903,25 +913,21 @@ with tab_add:
                     if opened_new_box:
                         st.warning(f"New box opened → mark BoxID = {boxid_input}")
 
-                    st.session_state.last_qr_link = qr_link
                     st.session_state.last_qr_uid = box_uid
+                    st.session_state.last_qr_png = qr_png_bytes_for_text(box_uid)
                     st.rerun()
                 except Exception as e:
                     st.error("Failed to save LN record")
                     st.code(err_detail(e), language="text")
 
-        if st.session_state.last_qr_link:
-            try:
-                png_bytes = fetch_bytes(st.session_state.last_qr_link)
-                st.download_button(
-                    label="⬇️ Download last saved QR PNG",
-                    data=png_bytes,
-                    file_name=f"{st.session_state.last_qr_uid or 'LN'}.png",
-                    mime="image/png",
-                    key="download_last_qr_png",
-                )
-            except Exception as e:
-                st.warning(f"Saved, but QR download failed: {e}")
+        if st.session_state.get("last_qr_png"):
+            st.download_button(
+                label="⬇️ Download last saved QR PNG",
+                data=st.session_state.last_qr_png,
+                file_name=f"{st.session_state.last_qr_uid or 'LN'}.png",
+                mime="image/png",
+                key="download_last_qr_png",
+            )
 
     else:
         st.subheader("🧊 Add to Freezer")
@@ -929,7 +935,7 @@ with tab_add:
 
         default_date = today_str_ny()
         current_max_boxnumber = get_current_max_boxnumber_global()
-        st.caption(f"Global current max BoxNumber/BoxID: {current_max_boxnumber if current_max_boxnumber else '(none)'}")
+        st.caption(f"Global current max BoxID (LN/Freezer): {current_max_boxnumber if current_max_boxnumber else '(none)'}")
 
         if not selected_freezer:
             st.error("Please select a Freezer in the top Context Bar.")
@@ -939,7 +945,7 @@ with tab_add:
 
         with st.form("add_fr_form", clear_on_submit=True):
             st.text_input("FreezerID (from context)", value=freezer_id_default, disabled=True, key="add_fr_freezer_locked")
-            freezer_id = freezer_id_default
+            freezer_id = freezer_id_default  # 3) FreezerID follows context (Tom/Jerry)
 
             box_choice = st.radio(
                 "BoxID option",
@@ -952,8 +958,8 @@ with tab_add:
             boxid = str(int(boxid_val))
 
             box_label_group = st.text_input("BoxLabel_group", placeholder="e.g., HP-COC / HN-CAN", key="add_fr_group").strip()
-            prefix = st.text_input("Prefix", placeholder="e.g., GICU / HCCU", key="add_fr_prefix").strip().upper()
-            tube_suffix = st.text_input("Tube suffix", placeholder="e.g., 02 036", key="add_fr_suffix").strip()
+            prefix = st.text_input("Prefix", placeholder="e.g., AD / GICU / HCCU", key="add_fr_prefix").strip().upper()
+            tube_suffix = st.text_input("Tube suffix", placeholder="e.g., 99 999", key="add_fr_suffix").strip()
             tube_amount = st.number_input("TubeAmount", min_value=1, step=1, value=1, key="add_fr_amt")
 
             date_collected = st.text_input("Date Collected", value=default_date, key="add_fr_date").strip()
@@ -979,6 +985,7 @@ with tab_add:
                 except Exception:
                     fr_all_df = pd.DataFrame()
 
+                # Duplicate check
                 def _norm(s: str) -> str:
                     return normalize_spaces(s)
 
@@ -1032,11 +1039,11 @@ with tab_add:
                 try:
                     append_row_by_header(service, FREEZER_TAB, data)
 
-                    # ✅ After saving Freezer record: copy Prefix + Tube suffix -> boxNumber!StudyID
-                    #    and use Freezer BoxID as boxNumber!BoxNumber
+                    # ✅ After saving Freezer record: insert into boxNumber
                     study_id_value = normalize_spaces(f"{prefix} {tube_suffix}".strip())
+                    box_number_value = str(int(tube_amount))  # your latest rule
                     try:
-                        insert_boxnumber_row(service, study_id_value=study_id_value, box_number=boxid)
+                        insert_boxnumber_row(service, study_id_value, box_number_value)
                     except Exception as e2:
                         st.warning(f"Saved freezer record, but boxNumber insert failed: {err_detail(e2)}")
 
@@ -1063,6 +1070,7 @@ with tab_use:
     except Exception:
         fr_all_df = pd.DataFrame()
 
+    # Auto-clean (optional)
     try:
         if not ln_all_df.empty and cleanup_zero_amount_rows(service, LN_TAB, ln_all_df, AMT_COL):
             ln_all_df = read_tab(LN_TAB)
@@ -1095,6 +1103,7 @@ with tab_use:
                 dfv["_suffix"] = dfv[TUBE_COL].map(lambda x: split_tube_number(x)[1])
 
                 scoped = dfv[dfv[TANK_COL] == safe_strip(selected_tank).upper()].copy()
+
                 if scoped.empty:
                     st.info(f"No records for {selected_tank}.")
                 else:
@@ -1234,6 +1243,7 @@ with tab_use:
                 dfv[AMT_COL] = pd.to_numeric(dfv[AMT_COL], errors="coerce").fillna(0).astype(int)
 
                 scoped = dfv[dfv[FREEZER_COL] == safe_strip(selected_freezer).upper()].copy()
+
                 if scoped.empty:
                     st.info(f"No records for {selected_freezer}.")
                 else:
